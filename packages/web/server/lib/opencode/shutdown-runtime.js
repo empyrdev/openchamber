@@ -16,8 +16,12 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     clearHealthCheckInterval,
     getTerminalRuntime,
     setTerminalRuntime,
+    getBrowserRuntime,
+    setBrowserRuntime,
     getMessageStreamRuntime,
     setMessageStreamRuntime,
+    getOpenChamberAgentEventsWebSocketRuntime,
+    setOpenChamberAgentEventsWebSocketRuntime,
     shouldSkipOpenCodeStop,
     getOpenCodePort,
     getOpenCodeProcess,
@@ -64,6 +68,16 @@ export const createGracefulShutdownRuntime = (dependencies) => {
       }
     }
 
+    const browserRuntime = getBrowserRuntime?.();
+    if (browserRuntime) {
+      try {
+        await browserRuntime.shutdown();
+      } catch {
+      } finally {
+        setBrowserRuntime?.(null);
+      }
+    }
+
     const messageStreamRuntime = getMessageStreamRuntime();
     if (messageStreamRuntime) {
       try {
@@ -71,6 +85,16 @@ export const createGracefulShutdownRuntime = (dependencies) => {
       } catch {
       } finally {
         setMessageStreamRuntime(null);
+      }
+    }
+
+    const openChamberAgentEventsWebSocketRuntime = getOpenChamberAgentEventsWebSocketRuntime?.();
+    if (openChamberAgentEventsWebSocketRuntime) {
+      try {
+        await openChamberAgentEventsWebSocketRuntime.close();
+      } catch {
+      } finally {
+        setOpenChamberAgentEventsWebSocketRuntime?.(null);
       }
     }
 

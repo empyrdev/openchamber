@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { SortableTabsStrip } from '@/components/ui/sortable-tabs-strip';
 import { PullRequestView } from '@/components/views/PullRequestView';
 import { TerminalView } from '@/components/views/TerminalView';
+import { AgentBrowserView } from '@/components/views/AgentBrowserView';
 import { lazyWithChunkRecovery } from '@/lib/chunkLoadRecovery';
 
 // Heavy views stay on-demand (same as MainLayout): importing DiffView/FilesView
@@ -170,6 +171,7 @@ const getModeLabel = (
   if (mode === 'plan') return t('contextPanel.mode.plan');
   if (mode === 'preview') return t('contextPanel.mode.preview');
   if (mode === 'browser') return t('contextPanel.mode.browser');
+  if (mode === 'agentBrowser') return t('contextPanel.mode.agentBrowser');
   if (mode === 'git') return t('layout.rightSidebar.git');
   if (mode === 'pr') return t('contextPanel.mode.pr');
   if (mode === 'notes') return t('contextRail.surface.notes');
@@ -294,6 +296,10 @@ const getTabIcon = (tab: { mode: ContextPanelMode; targetPath: string | null }):
 
   if (tab.mode === 'browser') {
     return <Icon name="global" className="h-3.5 w-3.5" />;
+  }
+
+  if (tab.mode === 'agentBrowser') {
+    return <Icon name="search-eye" className="h-3.5 w-3.5" />;
   }
 
   return undefined;
@@ -2737,6 +2743,10 @@ export const ContextPanel: React.FC = () => {
     () => tabs.some((tab) => tab.mode === 'terminal'),
     [tabs],
   );
+  const hasAgentBrowserTab = React.useMemo(
+    () => tabs.some((tab) => tab.mode === 'agentBrowser'),
+    [tabs],
+  );
   // Keep-alive: the walkthrough holds reading progress and scroll position that
   // a remount would silently throw away.
   const hasWalkthroughTab = React.useMemo(
@@ -3007,6 +3017,11 @@ export const ContextPanel: React.FC = () => {
             <TerminalView visible={isOpen && activeTab?.mode === 'terminal'} />
           </div>
         ) : null}
+        {hasAgentBrowserTab ? (
+          <div className={cn('absolute inset-0', activeTab?.mode === 'agentBrowser' ? 'block' : 'hidden')}>
+            <AgentBrowserView visible={isOpen && activeTab?.mode === 'agentBrowser'} />
+          </div>
+        ) : null}
         {hasWalkthroughTab ? (
           <div className={cn('absolute inset-0', activeTab?.mode === 'walkthrough' ? 'block' : 'hidden')}>
             <React.Suspense fallback={null}>
@@ -3014,7 +3029,7 @@ export const ContextPanel: React.FC = () => {
             </React.Suspense>
           </div>
         ) : null}
-        {activeTab?.mode !== 'chat' && !isFileTabActive && activeTab?.mode !== 'browser' && activeTab?.mode !== 'diff' && activeTab?.mode !== 'terminal' && activeTab?.mode !== 'walkthrough' ? activeNonChatContent : null}
+        {activeTab?.mode !== 'chat' && !isFileTabActive && activeTab?.mode !== 'browser' && activeTab?.mode !== 'agentBrowser' && activeTab?.mode !== 'diff' && activeTab?.mode !== 'terminal' && activeTab?.mode !== 'walkthrough' ? activeNonChatContent : null}
       </div>
       </div>
     </aside>

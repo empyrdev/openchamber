@@ -1,3 +1,5 @@
+import { discordIntegrationI18n } from './discord-integration.i18n';
+
 export const settingsDict = {
   'settings.providers.page.openCodeGo.title': 'OpenCode Go usage tracking',
   'settings.providers.page.openCodeGo.description': 'Connect the OpenCode Go dashboard to show rolling, weekly, and monthly quota.',
@@ -77,6 +79,7 @@ export const settingsDict = {
   'settings.page.skills.title': 'Skills',
   'settings.page.skillsCatalog.title': 'Skills Catalog',
   'settings.page.git.title': 'Git',
+  'settings.page.integrations.title': 'Integrations',
   'settings.page.appearance.title': 'Appearance',
   'settings.page.appearance.description': 'Customize how OpenChamber looks and feels.',
   'settings.page.chat.title': 'Chat',
@@ -1315,6 +1318,7 @@ export const settingsDict = {
   'settings.openchamber.worktrees.list.empty': 'No worktrees found for this project',
   'settings.openchamber.worktrees.list.detachedHead': 'Detached HEAD',
   'settings.openchamber.worktrees.list.deleteWorktreeAria': 'Delete worktree {name}',
+  'settings.openchamber.worktrees.list.openInDiscord': 'Open in Discord',
   'settings.agents.modelSelector.title': 'Select model',
   'settings.agents.modelSelector.searchPlaceholder': 'Search models',
   'settings.agents.modelSelector.selectPlaceholder': 'Select model...',
@@ -2119,4 +2123,5 @@ export const settingsDict = {
   'settings.openchamber.visual.field.followUpBehaviorDescription': 'Choose what happens when you press Enter on a follow-up message while the agent is still responding.',
   'settings.openchamber.visual.option.followUpBehavior.steer.label': 'Steer',
   'settings.openchamber.visual.option.followUpBehavior.queue.label': 'Queue',
+  ...discordIntegrationI18n.en,
 } as const;

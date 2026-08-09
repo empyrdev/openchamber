@@ -1,3 +1,5 @@
+import { discordIntegrationI18n } from './discord-integration.i18n';
+
 export const settingsDict = {
   'settings.providers.page.openCodeGo.title': 'Відстеження використання OpenCode Go',
   'settings.providers.page.openCodeGo.description': 'Підключіть панель OpenCode Go, щоб бачити ковзну, тижневу та місячну квоту.',
@@ -78,6 +80,7 @@ export const settingsDict = {
   "settings.page.skills.title": "Навички",
   "settings.page.skillsCatalog.title": "Каталог навичок",
   "settings.page.git.title": "Git",
+  "settings.page.integrations.title": "Інтеграції",
   "settings.page.appearance.title": "Зовнішній вигляд",
   "settings.page.appearance.description": "Налаштуйте вигляд і відчуття OpenChamber.",
   "settings.page.chat.title": "Чат",
@@ -1283,6 +1286,7 @@ export const settingsDict = {
   "settings.openchamber.worktrees.list.empty": "Для цього проєкту не знайдено worktree",
   "settings.openchamber.worktrees.list.detachedHead": "Відокремлено HEAD",
   "settings.openchamber.worktrees.list.deleteWorktreeAria": "Видалити worktree {name}",
+  "settings.openchamber.worktrees.list.openInDiscord": "Відкрити в Discord",
   "settings.agents.modelSelector.title": "Виберіть модель",
   "settings.agents.modelSelector.searchPlaceholder": "Пошук моделей",
   "settings.agents.modelSelector.selectPlaceholder": "Виберіть модель...",
@@ -2129,4 +2133,5 @@ export const settingsDict = {
   "settings.openchamber.visual.field.followUpBehaviorDescription": "Choose what happens when you press Enter on a follow-up message while the agent is still responding.",
   "settings.openchamber.visual.option.followUpBehavior.steer.label": "Steer",
   "settings.openchamber.visual.option.followUpBehavior.queue.label": "Queue",
+  ...discordIntegrationI18n.uk,
 } as const;
