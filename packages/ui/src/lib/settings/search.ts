@@ -937,13 +937,13 @@ const SETTINGS_SEARCH_ITEMS: readonly SettingsSearchItem[] = [
     id: 'integrations.discord',
     page: 'integrations',
     titleKey: 'settings.page.integrations.title',
-    keywords: ['discord', 'messenger', 'bot', 'slack', 'chat', 'connect', 'bridge'],
+    keywords: ['discord', 'messenger', 'bot', 'slack', 'chat', 'connect', 'bridge', 'critique', 'commands'],
   },
   {
     id: 'integrations.telegram',
     page: 'integrations',
     titleKey: 'settings.page.integrations.title',
-    keywords: ['telegram', 'messenger', 'bot', 'chat', 'connect', 'bridge', 'botfather'],
+    keywords: ['telegram', 'messenger', 'bot', 'chat', 'connect', 'bridge', 'botfather', 'critique', 'commands', 'groups', 'userinfobot'],
   },
 ] as const;
 

@@ -1187,12 +1187,12 @@ export function createMessengerOpencodeBridge({
   }
 
   /**
-   * Durably bind the Discord channel that hosted a successful bootstrap
+   * Durably bind the channel/chat that hosted a successful bootstrap
    * dialogue (`clone` | `path` | `new`) to the project it produced. Two layers:
    *
-   *  1. settings.discord.projectBindings — the authoritative channel→project
-   *     map the listener (buildResolveProject) and web→Discord mirroring
-   *     (resolveProjectChannel) read. Survives restarts.
+   *  1. settings.{discord|telegram}.projectBindings — the authoritative
+   *     channel→project map the listener (buildResolveProject) and web→Discord
+   *     mirroring (resolveProjectChannel) read. Survives restarts.
    *  2. bridge-store channel pre-bind (sessionId: '') — a RUNNING listener's
    *     resolveProject map was built at start and never re-read; the pre-bind
    *     lets routeInbound honor the binding immediately instead of re-opening
@@ -1204,7 +1204,7 @@ export function createMessengerOpencodeBridge({
    * project while the real conversation stayed orphaned here.
    */
   async function bindChannelToBootstrappedProject({ type, token, channelId, project }) {
-    if (type !== 'discord' || !channelId || !project?.path) return;
+    if ((type !== 'discord' && type !== 'telegram') || !channelId || !project?.path) return;
     const projectLabel =
       project.label ?? project.path.split('/').pop() ?? project.path;
     try {
@@ -1218,6 +1218,17 @@ export function createMessengerOpencodeBridge({
       });
     } catch {
       // best-effort — the persisted settings binding below is authoritative
+    }
+    if (type === 'telegram') {
+      const current = await readTelegramBindings();
+      if (!current) return;
+      const { telegram, bindings } = current;
+      const next = bindings.filter(
+        (b) => b && b.projectPath !== project.path && String(b.chatId) !== String(channelId),
+      );
+      next.push({ chatId: String(channelId), projectPath: project.path, projectLabel });
+      await persistTelegramBindings(next, telegram);
+      return;
     }
     const current = await readDiscordBindings();
     if (!current) return;
@@ -4075,9 +4086,51 @@ export function createMessengerOpencodeBridge({
 
     const removeProjectBindingForSurface = async () => {
       const settings = typeof readSettings === 'function' ? await readSettings().catch(() => null) : null;
+      const channelKeys = new Set([String(channelId), String(stableKey)]);
+      if (type === 'telegram') {
+        const telegram = settings?.telegram ?? {};
+        const bindings = Array.isArray(telegram.projectBindings) ? telegram.projectBindings : [];
+        const projectPath = stored?.projectPath
+          ?? bindings.find((b) => channelKeys.has(String(b?.chatId)))?.projectPath
+          ?? null;
+        const removedBinding = bindings.find(
+          (b) =>
+            (projectPath && b?.projectPath === projectPath) ||
+            channelKeys.has(String(b?.chatId)),
+        );
+        if (!projectPath && !removedBinding) {
+          return { ok: false, error: 'this Telegram chat is not bound to a project.' };
+        }
+        if (typeof persistSettings === 'function') {
+          const nextBindings = bindings.filter(
+            (b) =>
+              !(
+                (projectPath && b?.projectPath === projectPath) ||
+                channelKeys.has(String(b?.chatId))
+              ),
+          );
+          await persistSettings({
+            telegram: {
+              ...telegram,
+              projectBindings: nextBindings.length > 0 ? nextBindings : undefined,
+            },
+          }).catch(() => {});
+        }
+        for (const key of channelKeys) {
+          try {
+            bridgeStore.unbind({ type, botTokenHash: hash, targetKey: key });
+          } catch {
+            // best-effort
+          }
+        }
+        return {
+          ok: true,
+          projectPath: projectPath ?? removedBinding?.projectPath ?? null,
+          channelId: removedBinding?.chatId ?? channelId,
+        };
+      }
       const discord = settings?.discord ?? {};
       const bindings = Array.isArray(discord.projectBindings) ? discord.projectBindings : [];
-      const channelKeys = new Set([String(channelId), String(stableKey)]);
       const projectPath = stored?.projectPath
         ?? bindings.find((b) => channelKeys.has(String(b?.channelId)))?.projectPath
         ?? null;
@@ -4134,10 +4187,18 @@ export function createMessengerOpencodeBridge({
           return { ok: false, error: result?.error ?? 'project bootstrap failed' };
         }
         bindProjectToCurrentSurface(result.project);
-        const discord = await ensureDiscordProjectChannel(result.project).catch((err) => ({
-          ok: false,
-          error: err?.message ?? 'Discord channel sync failed',
-        }));
+        await bindChannelToBootstrappedProject({
+          type,
+          token,
+          channelId,
+          project: result.project,
+        });
+        const discord = type === 'discord'
+          ? await ensureDiscordProjectChannel(result.project).catch((err) => ({
+              ok: false,
+              error: err?.message ?? 'Discord channel sync failed',
+            }))
+          : { ok: false, error: 'not applicable' };
         return { ok: true, project: result.project, discord };
       },
 
@@ -4156,10 +4217,18 @@ export function createMessengerOpencodeBridge({
           return { ok: false, error: result?.error ?? 'project bootstrap failed' };
         }
         bindProjectToCurrentSurface(result.project);
-        const discord = await ensureDiscordProjectChannel(result.project).catch((err) => ({
-          ok: false,
-          error: err?.message ?? 'Discord channel sync failed',
-        }));
+        await bindChannelToBootstrappedProject({
+          type,
+          token,
+          channelId,
+          project: result.project,
+        });
+        const discord = type === 'discord'
+          ? await ensureDiscordProjectChannel(result.project).catch((err) => ({
+              ok: false,
+              error: err?.message ?? 'Discord channel sync failed',
+            }))
+          : { ok: false, error: 'not applicable' };
         return { ok: true, project: result.project, discord };
       },
 
@@ -4178,6 +4247,7 @@ export function createMessengerOpencodeBridge({
         return buildMessengerGitDiffReply({
           projectPath,
           critiqueEnabled: isCritiqueEnabled(type),
+          type,
         });
       },
 
@@ -5006,6 +5076,9 @@ export function createMessengerOpencodeBridge({
         async setPermissionModeDefault(mode) {
           bridgeStore.setPermissionModeDefault(type, mode);
         },
+        async setCritiqueEnabled(enabled) {
+          bridgeStore.setCritiqueEnabled?.(type, Boolean(enabled));
+        },
         async unbindSession() {
           bridgeStore.unbindSession({ type, botTokenHash: hash, targetKey: stableKey });
         },
@@ -5827,6 +5900,44 @@ export function createMessengerOpencodeBridge({
     try {
       await persistSettings({
         discord: { ...discord, projectBindings: normalized.length > 0 ? normalized : undefined },
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Read the persisted Telegram project→chat bindings. Returns a usable shape
+   * even when settings access is unavailable so callers can no-op safely.
+   */
+  async function readTelegramBindings() {
+    if (typeof readSettings !== 'function') return null;
+    try {
+      const settings = await readSettings();
+      const telegram = settings?.telegram ?? {};
+      const bindings = Array.isArray(telegram.projectBindings) ? telegram.projectBindings : [];
+      return { telegram, bindings };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Persist an updated bindings list, preserving the rest of the Telegram block. */
+  async function persistTelegramBindings(nextBindings, telegram) {
+    if (typeof persistSettings !== 'function') return;
+    const normalized = (Array.isArray(nextBindings) ? nextBindings : [])
+      .filter((b) => b && b.chatId && b.projectPath)
+      .map((b) => ({
+        chatId: String(b.chatId),
+        projectPath: String(b.projectPath),
+        projectLabel: b.projectLabel ? String(b.projectLabel) : undefined,
+        ...(b.messageThreadId != null
+          ? { messageThreadId: String(b.messageThreadId) }
+          : {}),
+      }));
+    try {
+      await persistSettings({
+        telegram: { ...telegram, projectBindings: normalized.length > 0 ? normalized : undefined },
       });
     } catch {
       // best-effort

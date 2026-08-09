@@ -50,6 +50,44 @@ describe('buildMessengerGitDiffReply', () => {
     expect(result.critiqueUrl).toBe('https://critique.work/v/abc123');
   });
 
+  it('uses Telegram-labeled critique title and settings path', async () => {
+    const uploadDiffFn = vi.fn(async () => ({
+      url: 'https://critique.work/v/tg123',
+      id: 'tg123',
+    }));
+    const enabled = await buildMessengerGitDiffReply({
+      projectPath: '/repo/project',
+      type: 'telegram',
+      getStatusFn: vi.fn(async () => ({
+        isClean: false,
+        files: [{ path: 'a.ts', index: ' ', working_dir: 'M' }],
+        diffStats: {},
+      })),
+      getDiffFn: vi.fn(async () => 'diff --git a/a.ts b/a.ts\n+x'),
+      uploadDiffFn,
+      critiqueEnabled: true,
+    });
+    expect(uploadDiffFn).toHaveBeenCalledWith({
+      title: 'project: Telegram /diff',
+      cwd: '/repo/project',
+    });
+    expect(enabled.reply).toContain('Review: https://critique.work/v/tg123');
+
+    const disabled = await buildMessengerGitDiffReply({
+      projectPath: '/repo/project',
+      type: 'telegram',
+      getStatusFn: vi.fn(async () => ({
+        isClean: false,
+        files: [{ path: 'a.ts', index: ' ', working_dir: 'M' }],
+        diffStats: {},
+      })),
+      getDiffFn: vi.fn(async () => 'diff --git a/a.ts b/a.ts\n+x'),
+      uploadDiffFn: vi.fn(async () => ({ url: 'https://critique.work/v/x' })),
+    });
+    expect(disabled.reply).toContain('Integrations → Telegram');
+    expect(disabled.reply).not.toContain('Integrations → Discord');
+  });
+
   it('keeps the inline preview when critique upload fails', async () => {
     const result = await buildMessengerGitDiffReply({
       projectPath: '/repo/project',
@@ -89,5 +127,6 @@ describe('buildMessengerGitDiffReply', () => {
     expect(result.reply).toContain('```diff');
     expect(result.reply).not.toContain('Review:');
     expect(result.reply).toContain('Shareable URL upload is off');
+    expect(result.reply).toContain('Integrations → Discord');
   });
 });

@@ -95,6 +95,13 @@ export function buildSlashCommandDefinitions() {
     },
     { name: 'mention-mode', description: 'Toggle mention-only mode for this channel' },
     { name: 'diff', description: 'Share a critique.work diff URL for this project/worktree' },
+    {
+      name: 'critique',
+      description: 'Toggle share-diffs-via-critique.work for Discord',
+      options: [
+        { type: STRING_OPTION, name: 'mode', description: 'on or off (omit to show current state)', required: false },
+      ],
+    },
     { name: 'usage', description: 'Show estimated token usage for this session' },
     { name: 'credits', description: 'Alias for /usage — show session usage' },
     {

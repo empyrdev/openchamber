@@ -38,6 +38,7 @@ export async function buildMessengerGitDiffReply({
   getDiffFn = getDiff,
   uploadDiffFn = uploadGitDiffViaCritique,
   critiqueEnabled = false,
+  type = 'discord',
 } = {}) {
   if (!projectPath) return { ok: false, error: 'no project bound to this conversation.' };
 
@@ -76,15 +77,17 @@ export async function buildMessengerGitDiffReply({
     }
   }
 
+  const surfaceLabel = type === 'telegram' ? 'Telegram' : 'Discord';
+
   // Shareable critique.work URL (kimaki-style). Opt-in only: uploading sends
   // the diff to an external service, so it runs solely when the user enabled
-  // critique in the OpenChamber Discord settings. Best-effort — keep the
+  // critique in the OpenChamber messenger settings. Best-effort — keep the
   // inline preview even when upload fails or critique/bunx is unavailable.
   let uploaded = null;
   if (critiqueEnabled) {
     const projectName = path.basename(projectPath);
     uploaded = await uploadDiffFn({
-      title: `${projectName}: Discord /diff`,
+      title: `${projectName}: ${surfaceLabel} /diff`,
       cwd: projectPath,
     }).catch(() => null);
     if (uploaded?.url) {
@@ -93,7 +96,10 @@ export async function buildMessengerGitDiffReply({
       lines.push('', `_Diff URL unavailable: ${escapeMd(clipBlock(uploaded.error, 120))}_`);
     }
   } else {
-    lines.push('', '_Shareable URL upload is off — enable "Share diffs via critique.work" in OpenChamber → Settings → Integrations → Discord._');
+    lines.push(
+      '',
+      `_Shareable URL upload is off — enable "Share diffs via critique.work" in OpenChamber → Settings → Integrations → ${surfaceLabel}._`,
+    );
   }
 
   if (preview) {

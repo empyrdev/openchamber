@@ -49,7 +49,7 @@ const VERBOSITY_DESCRIPTIONS = {
 
 // Commands we recognise. The `usage` text is shown by /help so order matters.
 const COMMAND_HELP = [
-  { name: 'help', usage: '/help [all]', summary: 'List Discord slash commands (or all messenger text commands with `/help all`)' },
+  { name: 'help', usage: '/help [all]', summary: 'List messenger commands (Discord slash set by default; `/help all` for every text command)' },
   {
     name: 'status',
     usage: '/status',
@@ -58,17 +58,17 @@ const COMMAND_HELP = [
   {
     name: 'add-project',
     usage: '/add-project <absolute-path> [label]',
-    summary: 'Register an existing directory as an OpenChamber project and bind this Discord channel',
+    summary: 'Register an existing directory as an OpenChamber project and bind this channel/chat',
   },
   {
     name: 'create-new-project',
     usage: '/create-new-project <name-or-absolute-path>',
-    summary: 'Create a folder, register it as a project, and ensure the Discord project channel exists',
+    summary: 'Create a folder, register it as a project, and bind this channel/chat (Discord also ensures a project channel)',
   },
   {
     name: 'remove-project',
     usage: '/remove-project',
-    summary: 'Unbind this Discord channel from its project without deleting files or Discord history',
+    summary: 'Unbind this channel/chat from its project without deleting files or chat history',
   },
   { name: 'abort', usage: '/abort', summary: 'Stop the current OpenCode turn' },
   {
@@ -96,6 +96,11 @@ const COMMAND_HELP = [
     summary: 'Upload a shareable critique.work diff URL (plus an inline preview) for this project/worktree',
   },
   {
+    name: 'critique',
+    usage: '/critique [on|off]',
+    summary: 'Toggle share-diffs-via-critique.work for this messenger (uploads diffs to an external service)',
+  },
+  {
     name: 'tunnel',
     usage: '/tunnel [cloudflare|ngrok] [quick|managed-local|managed-remote]',
     summary:
@@ -115,7 +120,7 @@ const COMMAND_HELP = [
     name: 'shell',
     usage: '/shell <command>',
     summary:
-      'Run a shell command in the project and show the output here. On Discord just prefix with `!` — `!pwd`, `!git status`, `!ls -la`; elsewhere use `/shell pwd`.',
+      'Run a shell command in the project and show the output here. On Discord you can also prefix with `!` — `!pwd`, `!git status`; elsewhere use `/shell pwd`.',
   },
   {
     name: 'model',
@@ -154,17 +159,17 @@ const COMMAND_HELP = [
   {
     name: 'session',
     usage: '/session <prompt>',
-    summary: 'Start a brand-new session (and thread) with the given prompt',
+    summary: 'Start a brand-new session (and thread when supported) with the given prompt',
   },
   {
     name: 'resume',
     usage: '/resume [n | session-id]',
-    summary: 'Resume a previous session — `/resume` lists candidates, `/resume 2` opens one in a new thread',
+    summary: 'Resume a previous session — `/resume` lists candidates, `/resume 2` opens one in a new thread when supported',
   },
   {
     name: 'fork',
     usage: '/fork',
-    summary: 'Clone this session with its full history into a new thread',
+    summary: 'Clone this session with its full history into a new thread when supported',
   },
   { name: 'share', usage: '/share', summary: 'Generate a public URL for the current session' },
   { name: 'unshare', usage: '/unshare', summary: 'Revoke the public URL for the current session' },
@@ -177,22 +182,22 @@ const COMMAND_HELP = [
   {
     name: 'mention-mode',
     usage: '/mention-mode',
-    summary: 'Toggle mention-only mode — when on, new sessions in this channel need an @mention',
+    summary: 'Toggle mention-only mode — when on, new sessions in this channel/chat need an @mention',
   },
   {
     name: 'new-worktree',
     usage: '/new-worktree [name]',
-    summary: 'Create an isolated git worktree + branch and work there in a new thread',
+    summary: 'Create an isolated git worktree + branch and work there in a new thread when supported',
   },
   {
     name: 'worktrees',
     usage: '/worktrees',
-    summary: 'List git worktrees for this channel project (with Discord thread links)',
+    summary: 'List git worktrees for this channel/chat project (with Discord thread links when available)',
   },
   {
     name: 'open-worktree',
     usage: '/open-worktree <branch-or-name>',
-    summary: 'Open an existing worktree in its Discord thread (UI-created worktrees included)',
+    summary: 'Open an existing worktree in its thread when supported (UI-created worktrees included)',
   },
   {
     name: 'worktree-status',
@@ -223,7 +228,7 @@ const COMMAND_HELP = [
   {
     name: 'session-id',
     usage: '/session-id',
-    summary: 'Show the current OpenCode session id and copyable Discord/session reference',
+    summary: 'Show the current OpenCode session id and a copyable session reference',
   },
   {
     name: 'schedule',
@@ -461,13 +466,16 @@ export async function executeMessengerCommand({
       }
       const r = await bridgeOps.addProject({ path: pathArg, label: labelParts.join(' ').trim() || null });
       if (!r.ok) return { reply: `✗ Could not add project: ${r.error ?? 'unknown error'}` };
+      const surfaceLabel = ctx?.type === 'telegram' ? 'Telegram chat' : 'Discord channel';
       return {
         reply: [
           `✓ Project bound: *${r.project.label ?? r.project.path}*`,
           `📁 \`${r.project.path}\``,
           r.discord?.ok && r.discord.channelId
             ? `Discord channel: <#${r.discord.channelId}>${r.discord.created ? ' _(created)_' : ' _(reused)_'}`
-            : `Discord channel: ${r.discord?.error ?? 'not configured'}`,
+            : ctx?.type === 'telegram'
+              ? `${surfaceLabel} bound to this project.`
+              : `Discord channel: ${r.discord?.error ?? 'not configured'}`,
         ].join('\n'),
       };
     }
@@ -488,7 +496,9 @@ export async function executeMessengerCommand({
           `📁 \`${r.project.path}\``,
           r.discord?.ok && r.discord.channelId
             ? `Discord channel: <#${r.discord.channelId}>${r.discord.created ? ' _(created)_' : ' _(reused)_'}`
-            : `Discord channel: ${r.discord?.error ?? 'not configured'}`,
+            : ctx?.type === 'telegram'
+              ? 'Telegram chat bound to this project.'
+              : `Discord channel: ${r.discord?.error ?? 'not configured'}`,
         ].join('\n'),
       };
     }
@@ -499,11 +509,16 @@ export async function executeMessengerCommand({
       }
       const r = await bridgeOps.removeProjectBinding();
       if (!r.ok) return { reply: `✗ Could not remove project binding: ${r.error ?? 'unknown error'}` };
+      const surfaceNoun = ctx?.type === 'telegram' ? 'Telegram chat' : 'Discord channel';
       return {
         reply: [
-          '✓ Project binding removed for this Discord channel.',
+          `✓ Project binding removed for this ${surfaceNoun}.`,
           r.projectPath ? `Files were not deleted: \`${r.projectPath}\`.` : 'No project files were touched.',
-          r.channelId ? `Discord channel <#${r.channelId}> was not deleted.` : 'Discord history was not deleted.',
+          r.channelId
+            ? ctx?.type === 'telegram'
+              ? `Telegram chat \`${r.channelId}\` was not deleted.`
+              : `Discord channel <#${r.channelId}> was not deleted.`
+            : 'Chat history was not deleted.',
         ].join('\n'),
       };
     }
@@ -598,6 +613,36 @@ export async function executeMessengerCommand({
       }
       const r = await bridgeOps.gitDiff();
       return { reply: r.ok ? r.reply : `✗ Diff failed: ${r.error ?? 'unknown error'}` };
+    }
+
+    case 'critique': {
+      if (typeof surfaceMutators?.setCritiqueEnabled !== 'function') {
+        return { reply: '✗ `/critique` is not available on this surface.' };
+      }
+      const raw = command.args.trim().toLowerCase();
+      const enabled = binding?.critiqueEnabled === true;
+      if (!raw) {
+        return {
+          reply: [
+            '**Share diffs via critique.work**',
+            `Currently: ${enabled ? '`on`' : '`off`'}`,
+            '',
+            'Toggle with `/critique on` or `/critique off`. Uploads send your code diffs to an external third-party service.',
+          ].join('\n'),
+        };
+      }
+      if (raw === 'on' || raw === 'enable' || raw === 'true' || raw === '1') {
+        await surfaceMutators.setCritiqueEnabled(true);
+        return {
+          reply:
+            '✓ Critique uploads enabled — `/diff`, `/undo`, and `/redo` may share diffs via critique.work.',
+        };
+      }
+      if (raw === 'off' || raw === 'disable' || raw === 'false' || raw === '0') {
+        await surfaceMutators.setCritiqueEnabled(false);
+        return { reply: '✓ Critique uploads disabled.' };
+      }
+      return { reply: '✗ Usage: `/critique [on|off]`.' };
     }
 
     case 'tunnel': {

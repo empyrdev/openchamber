@@ -12,6 +12,7 @@ function makeMutators() {
     setOverrides: vi.fn(async () => {}),
     setVerbosityDefault: vi.fn(async () => {}),
     setPermissionModeDefault: vi.fn(async () => {}),
+    setCritiqueEnabled: vi.fn(async () => {}),
     setProjectDefaults: vi.fn(async () => {}),
     unbindSession: vi.fn(async () => {}),
   };
@@ -731,8 +732,54 @@ describe('/help lists Discord slash commands', () => {
   it('/help all lists the full messenger catalog including text-only commands', async () => {
     const { result } = await run('/help all');
     expect(result.reply).toContain('**OpenChamber agent messenger commands**');
-    for (const cmd of ['/add-project', '/compact', '/tunnel', '/worktrees', '/mcp', '/queue']) {
+    for (const cmd of ['/add-project', '/compact', '/tunnel', '/worktrees', '/mcp', '/queue', '/critique']) {
       expect(result.reply).toContain(cmd);
     }
+  });
+});
+
+describe('/critique command', () => {
+  it('reports current status when called with no args', async () => {
+    const { result, surfaceMutators } = await run('/critique', {
+      binding: { critiqueEnabled: false },
+    });
+    expect(result.reply).toContain('Share diffs via critique.work');
+    expect(result.reply).toContain('`off`');
+    expect(result.reply).toContain('/critique on');
+    expect(surfaceMutators.setCritiqueEnabled).not.toHaveBeenCalled();
+  });
+
+  it('enables critique uploads', async () => {
+    const { result, surfaceMutators } = await run('/critique on');
+    expect(surfaceMutators.setCritiqueEnabled).toHaveBeenCalledWith(true);
+    expect(result.reply).toMatch(/enabled/i);
+  });
+
+  it('disables critique uploads', async () => {
+    const { result, surfaceMutators } = await run('/critique off', {
+      binding: { critiqueEnabled: true },
+    });
+    expect(surfaceMutators.setCritiqueEnabled).toHaveBeenCalledWith(false);
+    expect(result.reply).toMatch(/disabled/i);
+  });
+
+  it('rejects unknown args', async () => {
+    const { result, surfaceMutators } = await run('/critique maybe');
+    expect(surfaceMutators.setCritiqueEnabled).not.toHaveBeenCalled();
+    expect(result.reply).toContain('Usage');
+  });
+
+  it('works for Telegram surfaces', async () => {
+    const command = parseLeadingCommand('/critique on');
+    const surfaceMutators = makeMutators();
+    const result = await executeMessengerCommand({
+      command,
+      ctx: { type: 'telegram', token: 't', channelId: '-1001', threadId: null },
+      opencode: {},
+      binding: { critiqueEnabled: false },
+      surfaceMutators,
+    });
+    expect(surfaceMutators.setCritiqueEnabled).toHaveBeenCalledWith(true);
+    expect(result.reply).toMatch(/enabled/i);
   });
 });

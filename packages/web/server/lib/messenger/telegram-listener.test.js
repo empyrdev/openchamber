@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createTelegramListenerRegistry } from './telegram-listener.js';
 
 const TOKEN = '123456:ABC-DEF';
+/** Default owner for tests that exercise inbound routing (fail-closed without one). */
+const OWNER_OPTS = { defaultUserId: '42' };
 
 function jsonResponse(payload, status = 200) {
   return {
@@ -131,7 +133,7 @@ describe('telegram listener registry', () => {
     const broadcastEvent = vi.fn();
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent, bridge });
-    registry.start(TOKEN, {});
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => bridge.routeInbound.mock.calls.length > 0);
 
@@ -165,7 +167,7 @@ describe('telegram listener registry', () => {
     const { calls } = installFetchMock({ updateBatches: [[dmUpdate('/start')]] });
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, {});
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => calls.some((c) => c.method === 'sendMessage'));
     const sent = calls.find((c) => c.method === 'sendMessage');
@@ -178,7 +180,7 @@ describe('telegram listener registry', () => {
     installFetchMock({ updateBatches: [[groupUpdate('just chatter')]] });
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, { defaultReplyMode: 'mention' });
+    registry.start(TOKEN, { ...OWNER_OPTS, defaultReplyMode: 'mention' });
 
     await waitFor(() => registry.recent(TOKEN).messages.length > 0);
     // Let the dispatch finish (recent push happens before the bridge gate).
@@ -194,7 +196,7 @@ describe('telegram listener registry', () => {
     installFetchMock({ updateBatches: [[mention]] });
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, {});
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => bridge.routeInbound.mock.calls.length > 0);
     expect(bridge.routeInbound.mock.calls[0][0].text).toBe('hey summarize this');
@@ -209,7 +211,7 @@ describe('telegram listener registry', () => {
     });
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, {});
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => bridge.routeInbound.mock.calls.length > 0);
     expect(bridge.routeInbound).toHaveBeenCalledTimes(1);
@@ -234,7 +236,7 @@ describe('telegram listener registry', () => {
     });
     const bridge = makeBridge({ approvalContexts: new Map([['deadbeef12345678', { sessionID: 's1' }]]) });
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, {});
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => bridge.handleApprovalDecision.mock.calls.length > 0);
     expect(bridge.handleApprovalDecision).toHaveBeenCalledWith('deadbeef12345678', 'approve');
@@ -265,7 +267,7 @@ describe('telegram listener registry', () => {
     });
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, {});
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => bridge.handleQuestionDecision.mock.calls.length > 0);
     expect(bridge.handleQuestionDecision).toHaveBeenCalledWith('aaaabbbbccccdddd', 0, ['2']);
@@ -287,13 +289,34 @@ describe('telegram listener registry', () => {
     ]] });
     const bridge = makeBridge();
     registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
-    registry.start(TOKEN, { defaultUserId: '42' });
+    registry.start(TOKEN, OWNER_OPTS);
 
     await waitFor(() => bridge.routeInbound.mock.calls.length > 0);
     // Only the owner's message (userId 42) was forwarded; the stranger was denied.
     expect(bridge.routeInbound).toHaveBeenCalledTimes(1);
     expect(bridge.routeInbound.mock.calls[0][0].from.id).toBe('42');
     expect(registry.status(TOKEN).accessDeniedCount).toBe(1);
+  });
+
+  it('denies all inbound when no owner is configured (fail closed)', async () => {
+    installFetchMock({ updateBatches: [[dmUpdate('hello')]] });
+    const bridge = makeBridge();
+    registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
+    registry.start(TOKEN, {});
+
+    await waitFor(() => registry.status(TOKEN).accessDeniedCount > 0);
+    expect(bridge.routeInbound).not.toHaveBeenCalled();
+    expect(registry.status(TOKEN).lastAccessDeniedReason).toBe('no-owner-configured');
+  });
+
+  it('allows any listed owner user id', async () => {
+    installFetchMock({ updateBatches: [[dmUpdate('hello', { userId: 99 })]] });
+    const bridge = makeBridge();
+    registry = createTelegramListenerRegistry({ broadcastEvent: vi.fn(), bridge });
+    registry.start(TOKEN, { ownerUserIds: ['42', '99'] });
+
+    await waitFor(() => bridge.routeInbound.mock.calls.length > 0);
+    expect(bridge.routeInbound.mock.calls[0][0].from.id).toBe('99');
   });
 
   it('denies bot senders outright', async () => {
@@ -330,12 +353,14 @@ describe('telegram listener registry', () => {
       defaultReplyMode: 'mention',
       allowedChatIds: '-100500',
       defaultUserId: '42',
+      ownerUserIds: ['42', '99'],
     });
     expect(updated).toMatchObject({
       ok: true,
       updated: true,
       defaultReplyMode: 'mention',
       ownerUserId: '42',
+      ownerUserIds: ['42', '99'],
     });
     expect(updated.allowedChatIds).toEqual(['-100500']);
   });

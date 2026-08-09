@@ -39,6 +39,7 @@ import {
   DangerZoneRow,
   SessionBindingsPanel,
   StatusBadge,
+  TelegramUserInfoBotLink,
   formatRelative,
   type MessengerBehaviorStrings,
 } from './messenger-shared';
@@ -81,7 +82,7 @@ const MESSENGER_META: Record<MessengerType, MessengerMeta> = {
     targetHelp: (
       <>
         Message the bot, then read the id from the recent-messages list or ask{' '}
-        <strong>@userinfobot</strong>.
+        <TelegramUserInfoBotLink />.
       </>
     ),
   },

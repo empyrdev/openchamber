@@ -13,7 +13,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import type { I18nKey } from '@/lib/i18n';
+import { useI18n, type I18nKey } from '@/lib/i18n';
 import { Icon } from '@/components/icon/Icon';
 import type { IconName } from '@/components/icon/icons';
 
@@ -23,6 +23,56 @@ import type { IconName } from '@/components/icon/icons';
  * every user-facing string arrives already localized (see the call sites in
  * MessengerSection.tsx / TelegramCard.tsx).
  */
+
+/** Official Telegram Web deep link for @userinfobot (user-requested URL). */
+const TELEGRAM_USERINFOBOT_URL = 'https://web.telegram.org/k/#@userinfobot';
+
+/** Clickable @userinfobot link — visible handle is the product username. */
+export function TelegramUserInfoBotLink({ className }: { className?: string }) {
+  return (
+    <a
+      href={TELEGRAM_USERINFOBOT_URL}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={cn('text-primary hover:underline', className)}
+    >
+      @userinfobot
+    </a>
+  );
+}
+
+/** Localized copy with an embedded @userinfobot link (before + after keys). */
+export function TelegramUserInfoBotHint({
+  beforeKey,
+  afterKey,
+  className,
+}: {
+  beforeKey: I18nKey;
+  afterKey: I18nKey;
+  className?: string;
+}) {
+  const { t } = useI18n();
+  return (
+    <span className={className}>
+      {t(beforeKey)}
+      <TelegramUserInfoBotLink />
+      {t(afterKey)}
+    </span>
+  );
+}
+
+/** Parse comma/whitespace/newline-separated messenger ids into a unique list. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function parseMessengerIdList(value: string): string[] {
+  return Array.from(
+    new Set(
+      value
+        .split(/[\s,]+/)
+        .map((id) => id.trim())
+        .filter(Boolean),
+    ),
+  );
+}
 
 export type MessengerStatusLabels = Record<
   MessengerConnection['status'],

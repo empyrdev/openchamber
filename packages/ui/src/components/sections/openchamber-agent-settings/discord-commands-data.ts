@@ -58,7 +58,16 @@ export const DISCORD_COMMANDS: DiscordCommandEntry[] = [
   { name: 'clear-queue', descriptionKey: 'settings.integrations.discord.commands.desc.clearQueue', category: 'queue', nativeSlash: true },
   { name: 'mention-mode', descriptionKey: 'settings.integrations.discord.commands.desc.mentionMode', category: 'queue', nativeSlash: true },
   { name: 'diff', descriptionKey: 'settings.integrations.discord.commands.desc.diff', category: 'git', suggested: true, nativeSlash: true },
+  {
+    name: 'critique',
+    descriptionKey: 'settings.integrations.discord.commands.desc.critique',
+    category: 'git',
+    suggested: true,
+    nativeSlash: true,
+    example: '/critique on',
+  },
   { name: 'usage', descriptionKey: 'settings.integrations.discord.commands.desc.usage', category: 'chat', suggested: true, nativeSlash: true },
+
   { name: 'credits', descriptionKey: 'settings.integrations.discord.commands.desc.credits', category: 'chat', nativeSlash: true },
   { name: 'shell', descriptionKey: 'settings.integrations.discord.commands.desc.shell', category: 'shell', example: '/shell command:pwd', nativeSlash: true },
   { name: 'new-worktree', descriptionKey: 'settings.integrations.discord.commands.desc.newWorktree', category: 'git', nativeSlash: true },

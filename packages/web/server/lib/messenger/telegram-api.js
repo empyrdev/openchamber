@@ -149,3 +149,60 @@ export function buildTelegramInlineKeyboard(rows) {
     );
   return keyboard.length > 0 ? { inline_keyboard: keyboard } : null;
 }
+
+/** getChat — used to detect forum groups (is_forum) before topic creation. */
+export async function getTelegramChat({ token, chatId }) {
+  const r = await telegramApi(token, 'getChat', { chat_id: chatId });
+  if (!r.ok) {
+    return { ok: false, error: friendlyTelegramError(r.status, r.body, r.error), chat: null };
+  }
+  return { ok: true, chat: r.body?.result ?? null };
+}
+
+/**
+ * getChatMember for the bot itself — reads administrator privileges such as
+ * can_manage_topics (required to create forum topics via Bot API).
+ */
+export async function getTelegramChatMember({ token, chatId, userId }) {
+  const r = await telegramApi(token, 'getChatMember', {
+    chat_id: chatId,
+    user_id: userId,
+  });
+  if (!r.ok) {
+    return { ok: false, error: friendlyTelegramError(r.status, r.body, r.error), member: null };
+  }
+  return { ok: true, member: r.body?.result ?? null };
+}
+
+/**
+ * Create a forum topic in a forum supergroup. Returns the new message_thread_id.
+ * Callers must check is_forum + can_manage_topics first; Bot API rejects otherwise.
+ */
+export async function createTelegramForumTopic({ token, chatId, name }) {
+  const payload = {
+    chat_id: chatId,
+    name: String(name ?? 'project').slice(0, 128) || 'project',
+  };
+  const r = await telegramApi(token, 'createForumTopic', payload);
+  if (!r.ok) {
+    return {
+      ok: false,
+      error: friendlyTelegramError(r.status, r.body, r.error),
+      messageThreadId: null,
+    };
+  }
+  const result = r.body?.result ?? null;
+  const messageThreadId = result?.message_thread_id ?? null;
+  return { ok: true, messageThreadId, topic: result };
+}
+
+/**
+ * True when the bot member result can create forum topics.
+ * Creator always can; administrators need the can_manage_topics privilege.
+ */
+export function telegramMemberCanManageTopics(member) {
+  if (!member || typeof member !== 'object') return false;
+  if (member.status === 'creator') return true;
+  if (member.status === 'administrator' && member.can_manage_topics === true) return true;
+  return false;
+}

@@ -7,6 +7,10 @@ import {
   useMessengerStore,
   type MessengerConnection,
 } from '@/stores/useMessengerStore';
+import {
+  TelegramUserInfoBotHint,
+  parseMessengerIdList,
+} from './messenger-shared';
 
 const TOTAL_STEPS = 3;
 const BOTFATHER_URL = 'https://t.me/BotFather';
@@ -40,10 +44,12 @@ export function TelegramOnboardingWizard({ conn }: TelegramOnboardingWizardProps
   const listenerRunning = Boolean(conn.telegramListenerRunning);
   const listenerLive = Boolean(conn.telegramListenerRunning && conn.telegramListenerConnected);
   const listenerStuck = listenerRunning && !listenerLive && !startingListener;
+  const ownerUserIds = conn.telegramOwnerUserIds ?? [];
+  const hasOwners = ownerUserIds.length > 0;
 
   const canAdvance = (() => {
     if (step === 0) return hasToken && isConnected;
-    if (step === 1) return true; // chat/owner ids are optional — the bot works without them
+    if (step === 1) return hasOwners;
     if (step === 2) return listenerRunning;
     return false;
   })();
@@ -214,7 +220,7 @@ export function TelegramOnboardingWizard({ conn }: TelegramOnboardingWizardProps
         </div>
       )}
 
-      {/* Step 1: Chat + owner ids (optional) */}
+      {/* Step 1: Chat (optional) + owner ids (required) */}
       {step === 1 && (
         <div className="space-y-3">
           <div>
@@ -231,7 +237,10 @@ export function TelegramOnboardingWizard({ conn }: TelegramOnboardingWizardProps
                 {t('settings.integrations.telegram.wizard.step2.chatLabel')}
               </label>
               <p className="text-[10px] text-muted-foreground">
-                {t('settings.integrations.telegram.wizard.step2.chatHint')}
+                <TelegramUserInfoBotHint
+                  beforeKey="settings.integrations.telegram.wizard.step2.chatHint.before"
+                  afterKey="settings.integrations.telegram.wizard.step2.chatHint.after"
+                />
               </p>
               <div className="flex gap-2">
                 <input
@@ -263,28 +272,38 @@ export function TelegramOnboardingWizard({ conn }: TelegramOnboardingWizardProps
               </code>
             </div>
           )}
-          {!conn.defaultUserId ? (
+          {!hasOwners ? (
             <div className="space-y-1">
               <label className="text-[11px] font-medium text-foreground">
                 {t('settings.integrations.telegram.wizard.step2.userLabel')}
               </label>
               <p className="text-[10px] text-muted-foreground">
-                {t('settings.integrations.telegram.wizard.step2.userHint')}
+                <TelegramUserInfoBotHint
+                  beforeKey="settings.integrations.telegram.wizard.step2.userHint.before"
+                  afterKey="settings.integrations.telegram.wizard.step2.userHint.after"
+                />
+              </p>
+              <p className="text-[10px] text-[var(--status-warning)] leading-snug">
+                {t('settings.integrations.telegram.wizard.step2.userRequired')}
               </p>
               <div className="flex gap-2">
-                <input
-                  type="text"
+                <textarea
                   value={userInput}
                   onChange={(e) => setUserInput(e.target.value)}
-                  placeholder="123456789"
-                  className={inputClass}
+                  placeholder={t('settings.integrations.telegram.wizard.step2.userPlaceholder')}
+                  className={cn(inputClass, 'min-h-16 resize-y')}
                 />
                 <Button
                   type="button"
                   size="sm"
-                  disabled={!userInput.trim()}
+                  disabled={parseMessengerIdList(userInput).length === 0}
                   onClick={() => {
-                    updateConnection('telegram', { defaultUserId: userInput.trim() });
+                    const telegramOwnerUserIds = parseMessengerIdList(userInput);
+                    if (telegramOwnerUserIds.length === 0) return;
+                    updateConnection('telegram', {
+                      telegramOwnerUserIds,
+                      defaultUserId: telegramOwnerUserIds[0],
+                    });
                     setUserInput('');
                     setTimeout(() => saveTelegramConfig(), 0);
                   }}
@@ -294,11 +313,13 @@ export function TelegramOnboardingWizard({ conn }: TelegramOnboardingWizardProps
               </div>
             </div>
           ) : (
-            <div className="flex items-center gap-2 text-xs">
-              <Icon name="check" className="size-3.5 text-[var(--status-success)]" />
-              <code className="rounded bg-muted px-1.5 py-0.5 text-[10px]">
-                {conn.defaultUserId}
-              </code>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-xs">
+                <Icon name="check" className="size-3.5 text-[var(--status-success)]" />
+                <code className="rounded bg-muted px-1.5 py-0.5 text-[10px]">
+                  {ownerUserIds.join(', ')}
+                </code>
+              </div>
             </div>
           )}
           {conn.telegramCanReadAllGroupMessages === false && (

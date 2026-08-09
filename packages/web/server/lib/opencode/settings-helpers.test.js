@@ -74,6 +74,14 @@ describe('settings helpers', () => {
     expect(helpers.sanitizeSettingsUpdate({ wideChatLayoutEnabled: 'true' })).toEqual({});
   });
 
+  it('accepts only booleans for collapsible user messages', () => {
+    const helpers = createTestHelpers();
+
+    expect(helpers.sanitizeSettingsUpdate({ collapsibleUserMessages: true })).toEqual({ collapsibleUserMessages: true });
+    expect(helpers.sanitizeSettingsUpdate({ collapsibleUserMessages: false })).toEqual({ collapsibleUserMessages: false });
+    expect(helpers.sanitizeSettingsUpdate({ collapsibleUserMessages: 'true' })).toEqual({});
+  });
+
   it('accepts messageStreamTransport as a persisted shared setting', () => {
     const helpers = createTestHelpers();
 
@@ -329,11 +337,33 @@ describe('settings helpers', () => {
         botToken: 'tok',
         defaultChatId: '-1001',
         defaultUserId: '42',
+        ownerUserIds: ['42'],
         allowedChatIds: ['-1001', '55'],
         defaultReplyMode: 'mention',
         listenerEnabled: false,
         autoReply: true,
       },
+    });
+
+    expect(helpers.sanitizeSettingsUpdate({
+      telegram: {
+        botToken: 'tok',
+        ownerUserIds: ['99', '0', '42', '99'],
+        defaultUserId: '42',
+      },
+    })).toEqual({
+      telegram: {
+        botToken: 'tok',
+        defaultUserId: '42',
+        ownerUserIds: ['42', '99'],
+      },
+    });
+
+    // Literal "0" / empty owner lists are dropped (never persist a zero owner).
+    expect(helpers.sanitizeSettingsUpdate({
+      telegram: { botToken: 'tok', defaultUserId: '0', ownerUserIds: ['0', ''] },
+    })).toEqual({
+      telegram: { botToken: 'tok' },
     });
 
     // Invalid entries are dropped; bridgeEnabled always coerces to true.
@@ -351,6 +381,44 @@ describe('settings helpers', () => {
     );
     expect(merged.telegram).toBeUndefined();
     expect(merged.themeId).toBe('default');
+  });
+
+  it('normalizes telegram chatPolicies and projectBindings, dropping invalid entries', () => {
+    const helpers = createTestHelpers();
+
+    expect(helpers.sanitizeSettingsUpdate({
+      telegram: {
+        botToken: 'tok',
+        chatPolicies: {
+          '-1001': { enabled: true, replyMode: 'mention', syncProjects: true },
+          '-1002': { enabled: false },
+          '-1003': { replyMode: 'inherit' },
+          '': { enabled: true },
+          '-1004': { replyMode: 'bogus', enabled: 'yes', syncProjects: 'true' },
+          '-1005': {},
+        },
+        projectBindings: [
+          { chatId: '-1001', projectPath: '/a', projectLabel: 'A', messageThreadId: '42' },
+          { chatId: '-1002', projectPath: '/b' },
+          { chatId: '', projectPath: '/x' },
+          { chatId: '-1003' },
+          null,
+        ],
+      },
+    })).toEqual({
+      telegram: {
+        botToken: 'tok',
+        chatPolicies: {
+          '-1001': { enabled: true, replyMode: 'mention', syncProjects: true },
+          '-1002': { enabled: false },
+          '-1003': { replyMode: 'inherit' },
+        },
+        projectBindings: [
+          { chatId: '-1001', projectPath: '/a', projectLabel: 'A', messageThreadId: '42' },
+          { chatId: '-1002', projectPath: '/b' },
+        ],
+      },
+    });
   });
 
   it('strips the telegram bot token from the formatted settings response', () => {

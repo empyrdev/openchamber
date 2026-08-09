@@ -1,3 +1,8 @@
+import {
+  normalizeTelegramChatIds,
+  normalizeTelegramUserIds,
+} from '../messenger/telegram-access.js';
+
 export const createSettingsHelpers = (dependencies) => {
   const {
     normalizePathForPersistence,
@@ -565,6 +570,9 @@ export const createSettingsHelpers = (dependencies) => {
         result.userMessageRenderingMode = mode;
       }
     }
+    if (typeof candidate.collapsibleUserMessages === 'boolean') {
+      result.collapsibleUserMessages = candidate.collapsibleUserMessages;
+    }
     if (typeof candidate.stickyUserHeader === 'boolean') {
       result.stickyUserHeader = candidate.stickyUserHeader;
     }
@@ -987,10 +995,25 @@ export const createSettingsHelpers = (dependencies) => {
         result.defaultChatId = chatId;
       }
     }
-    if (typeof value.defaultUserId === 'string') {
-      const userId = value.defaultUserId.trim();
-      if (userId.length > 0) {
-        result.defaultUserId = userId;
+    // Prefer ownerUserIds; still accept legacy defaultUserId / ownerUserId.
+    // Reject literal "0". Persist both ownerUserIds and defaultUserId (first)
+    // so older UI readers keep working.
+    const hasOwnerUserIds = Object.prototype.hasOwnProperty.call(value, 'ownerUserIds');
+    const hasDefaultUserId = Object.prototype.hasOwnProperty.call(value, 'defaultUserId');
+    const hasOwnerUserId = Object.prototype.hasOwnProperty.call(value, 'ownerUserId');
+    if (hasOwnerUserIds || hasDefaultUserId || hasOwnerUserId) {
+      const ownerUserIds = normalizeTelegramUserIds([
+        ...(hasDefaultUserId ? [value.defaultUserId] : []),
+        ...(hasOwnerUserId ? [value.ownerUserId] : []),
+        ...(hasOwnerUserIds
+          ? Array.isArray(value.ownerUserIds)
+            ? value.ownerUserIds
+            : [value.ownerUserIds]
+          : []),
+      ]);
+      if (ownerUserIds.length > 0) {
+        result.ownerUserIds = ownerUserIds;
+        result.defaultUserId = ownerUserIds[0];
       }
     }
     if (typeof value.autoReply === 'boolean') {
@@ -1000,13 +1023,49 @@ export const createSettingsHelpers = (dependencies) => {
       result.defaultReplyMode = value.defaultReplyMode;
     }
     if (Array.isArray(value.allowedChatIds)) {
-      result.allowedChatIds = Array.from(
-        new Set(
-          value.allowedChatIds
-            .map((id) => (typeof id === 'string' ? id.trim() : String(id ?? '').trim()))
-            .filter((id) => id.length > 0),
-        ),
-      );
+      result.allowedChatIds = normalizeTelegramChatIds(value.allowedChatIds);
+    }
+    // Per-chat policies (Discord guildPolicies analogue): enabled mute, reply
+    // mode override, and whether Sync Now mirrors projects into that chat.
+    if (value.chatPolicies && typeof value.chatPolicies === 'object' && !Array.isArray(value.chatPolicies)) {
+      const chatPolicies = {};
+      for (const [chatId, entry] of Object.entries(value.chatPolicies)) {
+        if (typeof chatId !== 'string' || chatId.length === 0) {
+          continue;
+        }
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+          continue;
+        }
+        const policy = {};
+        if (typeof entry.enabled === 'boolean') {
+          policy.enabled = entry.enabled;
+        }
+        if (entry.replyMode === 'always' || entry.replyMode === 'mention' || entry.replyMode === 'inherit') {
+          policy.replyMode = entry.replyMode;
+        }
+        if (typeof entry.syncProjects === 'boolean') {
+          policy.syncProjects = entry.syncProjects;
+        }
+        if (Object.keys(policy).length > 0) {
+          chatPolicies[chatId] = policy;
+        }
+      }
+      if (Object.keys(chatPolicies).length > 0) {
+        result.chatPolicies = chatPolicies;
+      }
+    }
+    // chatId → project path bindings (optional message_thread_id for forum topics).
+    if (Array.isArray(value.projectBindings)) {
+      result.projectBindings = value.projectBindings
+        .filter((binding) => binding && typeof binding === 'object' && binding.chatId && binding.projectPath)
+        .map((binding) => ({
+          chatId: String(binding.chatId),
+          projectPath: String(binding.projectPath),
+          ...(binding.projectLabel ? { projectLabel: String(binding.projectLabel) } : {}),
+          ...(binding.messageThreadId != null && String(binding.messageThreadId).length > 0
+            ? { messageThreadId: String(binding.messageThreadId) }
+            : {}),
+        }));
     }
     // Global bridge mute is not a Telegram setting either — responding is
     // governed by access control (owner / allowed chats). Coerce legacy false

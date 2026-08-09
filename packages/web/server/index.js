@@ -1088,6 +1088,19 @@ const openCodeLifecycleRuntime = createOpenCodeLifecycleRuntime({
     }
     return [...new Set(directories)];
   },
+  // A managed restart can move OpenCode to a NEW port (the old one may stay
+  // occupied by an orphaned process, e.g. killProcessOnPort is a no-op on
+  // Windows). Rebind the message-stream upstream readers to the current port
+  // so the UI keeps receiving events instead of staying pinned to the old
+  // process (#2638). The runtime is created later by the startup pipeline;
+  // by the time any restart runs, it is assigned.
+  onOpenCodeRestarted: () => {
+    try {
+      messageStreamRuntime?.rebindUpstream();
+    } catch (error) {
+      console.warn('Failed to rebind message stream after OpenCode restart:', error?.message ?? error);
+    }
+  },
   getManagedOpenCodeEnv: async () => {
     const settings = await readSettingsFromDiskMigrated().catch(() => null);
     const managedEnv = settings?.agentControlToolEnabled === false
@@ -1510,6 +1523,10 @@ async function main(options = {}) {
   // relay candidate lazily at request time, so a late-bound holder is enough.
   let relayServiceInstance = null;
 
+  // Same pattern for the tunnel runtime: created after the base routes so
+  // /api/system/info resolves port + tunnel URL lazily at request time.
+  let tunnelRuntimeContextHolder = null;
+
   const bootstrapResult = bootstrapRuntime.setupBaseRoutes(app, {
     process,
     openchamberVersion: OPENCHAMBER_VERSION,
@@ -1546,6 +1563,15 @@ async function main(options = {}) {
         apiOnly,
       };
     },
+    // Port this instance serves on and the active tunnel's public URL (if
+    // any), for /api/system/info. Resolved lazily because the tunnel runtime
+    // is created after these base routes are registered.
+    getServerPort: () => {
+      const activePort = tunnelRuntimeContextHolder?.getActivePort?.();
+      if (Number.isFinite(activePort) && activePort > 0) return activePort;
+      return Number.isFinite(port) && port > 0 ? port : null;
+    },
+    getTunnelUrl: () => tunnelRuntimeContextHolder?.tunnelService?.getPublicUrl?.() ?? null,
     verboseRequestLogs: OPENCHAMBER_VERBOSE_REQUEST_LOGS,
     uiPassword,
     tunnelAuthController,
@@ -1621,6 +1647,7 @@ async function main(options = {}) {
 
   const tunnelRuntimeContext = tunnelWiringRuntime.initialize(app, port);
   const { tunnelService, startTunnelWithNormalizedRequest } = tunnelRuntimeContext;
+  tunnelRuntimeContextHolder = tunnelRuntimeContext;
 
   // Private relay host service: config + management routes + host client
   // lifecycle. Loopback port comes from the same source the tunnel uses so
@@ -1987,6 +2014,7 @@ async function main(options = {}) {
           const result = telegramListener.start(telegramConfig.botToken, {
             autoReply: telegramConfig.autoReply !== false,
             defaultUserId: telegramConfig.defaultUserId,
+            ownerUserIds: telegramConfig.ownerUserIds,
             allowedChatIds: telegramConfig.allowedChatIds,
             defaultReplyMode: telegramConfig.defaultReplyMode,
           });
@@ -2050,6 +2078,7 @@ async function main(options = {}) {
           const startResult = telegramListener.start(cfg.botToken, {
             autoReply: cfg.autoReply !== false,
             defaultUserId: cfg.defaultUserId,
+            ownerUserIds: cfg.ownerUserIds,
             allowedChatIds: cfg.allowedChatIds,
             defaultReplyMode: cfg.defaultReplyMode,
           });

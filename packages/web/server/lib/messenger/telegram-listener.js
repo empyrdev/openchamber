@@ -7,6 +7,7 @@ import {
 } from './telegram-api.js';
 import {
   evaluateTelegramAccess,
+  effectiveTelegramChatReplyMode,
   normalizeTelegramAccessSettings,
 } from './telegram-access.js';
 
@@ -152,8 +153,9 @@ async function dispatchMessage(state, update, broadcastEvent, bridge) {
     chatId: chat.id ?? null,
     chatType,
     isBot: Boolean(from.is_bot),
-    ownerUserId: state.ownerUserId,
+    ownerUserIds: state.ownerUserIds,
     allowedChatIds: state.allowedChatIds,
+    chatPolicies: state.chatPolicies,
   });
   if (!access.allowed) {
     state.accessDeniedCount = (state.accessDeniedCount || 0) + 1;
@@ -184,7 +186,7 @@ async function dispatchMessage(state, update, broadcastEvent, bridge) {
   // Reply-mode gating. DMs always reach the bot. Groups reach it when the
   // message addresses the bot (@mention, reply, /command) or the chat already
   // has a session binding — mirroring Discord's mention-mode semantics.
-  // `defaultReplyMode: 'mention'` additionally confines groups to addressed
+  // Per-chat replyMode (with inherit → default) confines groups to addressed
   // messages even when the chat is unbound.
   const isGroup = chatType === 'group' || chatType === 'supergroup';
   const command = parseTelegramCommand(text, state.botUsername);
@@ -197,7 +199,9 @@ async function dispatchMessage(state, update, broadcastEvent, bridge) {
       channelId: String(chat.id),
       threadId: message.message_thread_id ?? null,
     });
-    const mentionOnly = state.defaultReplyMode === 'mention';
+    const mentionOnly =
+      effectiveTelegramChatReplyMode(state.defaultReplyMode, state.chatPolicies, chat.id) ===
+      'mention';
     if (mentionOnly || !hasBinding) {
       state.filteredOutCount += 1;
       return;
@@ -309,8 +313,9 @@ async function dispatchCallbackQuery(state, callbackQuery, broadcastEvent, bridg
     chatId,
     chatType: message?.chat?.type ?? null,
     isBot: Boolean(from.is_bot),
-    ownerUserId: state.ownerUserId,
+    ownerUserIds: state.ownerUserIds,
     allowedChatIds: state.allowedChatIds,
+    chatPolicies: state.chatPolicies,
   });
   if (!access.allowed) {
     state.accessDeniedCount = (state.accessDeniedCount || 0) + 1;
@@ -555,6 +560,7 @@ export function createTelegramListenerRegistry({ broadcastEvent, bridge = null }
     const access = normalizeTelegramAccessSettings({
       defaultUserId: opts.defaultUserId,
       ownerUserId: opts.ownerUserId,
+      ownerUserIds: opts.ownerUserIds,
       allowedChatIds: opts.allowedChatIds,
     });
     const state = {
@@ -562,8 +568,12 @@ export function createTelegramListenerRegistry({ broadcastEvent, bridge = null }
       autoReply: opts.autoReply !== false,
       bridgeEnabled: true,
       defaultReplyMode: opts.defaultReplyMode === 'mention' ? 'mention' : 'always',
-      ownerUserId: access.ownerUserId,
+      ownerUserIds: access.ownerUserIds,
       allowedChatIds: access.allowedChatIds,
+      chatPolicies:
+        opts.chatPolicies && typeof opts.chatPolicies === 'object' && !Array.isArray(opts.chatPolicies)
+          ? opts.chatPolicies
+          : {},
       resolveProject: opts.resolveProject ?? null,
       abort: new AbortController(),
       offset: 0,
@@ -635,8 +645,10 @@ export function createTelegramListenerRegistry({ broadcastEvent, bridge = null }
       autoReply: state.autoReply,
       bridgeEnabled: state.bridgeEnabled,
       defaultReplyMode: state.defaultReplyMode,
-      ownerUserId: state.ownerUserId || undefined,
+      ownerUserIds: state.ownerUserIds.length > 0 ? state.ownerUserIds : undefined,
+      ownerUserId: state.ownerUserIds[0] || undefined,
       allowedChatIds: state.allowedChatIds.length > 0 ? state.allowedChatIds : undefined,
+      chatPolicies: state.chatPolicies && Object.keys(state.chatPolicies).length > 0 ? state.chatPolicies : undefined,
       botId: state.botId,
       botUsername: state.botUsername,
       startedAt: state.startedAt,
@@ -670,17 +682,25 @@ export function createTelegramListenerRegistry({ broadcastEvent, bridge = null }
     }
     if (
       Object.prototype.hasOwnProperty.call(opts, 'defaultUserId') ||
-      Object.prototype.hasOwnProperty.call(opts, 'ownerUserId')
+      Object.prototype.hasOwnProperty.call(opts, 'ownerUserId') ||
+      Object.prototype.hasOwnProperty.call(opts, 'ownerUserIds')
     ) {
-      state.ownerUserId = normalizeTelegramAccessSettings({
+      state.ownerUserIds = normalizeTelegramAccessSettings({
         defaultUserId: opts.defaultUserId,
         ownerUserId: opts.ownerUserId,
-      }).ownerUserId;
+        ownerUserIds: opts.ownerUserIds,
+      }).ownerUserIds;
     }
     if (Object.prototype.hasOwnProperty.call(opts, 'allowedChatIds')) {
       state.allowedChatIds = normalizeTelegramAccessSettings({
         allowedChatIds: opts.allowedChatIds,
       }).allowedChatIds;
+    }
+    if (Object.prototype.hasOwnProperty.call(opts, 'chatPolicies')) {
+      state.chatPolicies =
+        opts.chatPolicies && typeof opts.chatPolicies === 'object' && !Array.isArray(opts.chatPolicies)
+          ? opts.chatPolicies
+          : {};
     }
     state.bridgeEnabled = true;
   }

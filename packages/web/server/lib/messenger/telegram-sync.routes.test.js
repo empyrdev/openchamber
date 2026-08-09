@@ -155,7 +155,15 @@ describe('messenger /telegram config persistence', () => {
 
     const res = await request(createApp({ readSettings, persistSettings }).app)
       .post('/api/messenger/telegram/save-config')
-      .send({ defaultUserId: '42', allowedChatIds: `${CHAT} -1009`, defaultReplyMode: 'mention' });
+      .send({
+        defaultUserId: '42',
+        allowedChatIds: `${CHAT} -1009`,
+        defaultReplyMode: 'mention',
+        chatPolicies: {
+          [CHAT]: { enabled: true, replyMode: 'always', syncProjects: true },
+          '-1009': { enabled: false },
+        },
+      });
 
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
@@ -163,9 +171,16 @@ describe('messenger /telegram config persistence', () => {
     expect(saved.botToken).toBe(SETTINGS_TOKEN);
     expect(saved.defaultChatId).toBe(CHAT);
     expect(saved.defaultUserId).toBe('42');
+    expect(saved.ownerUserIds).toEqual(['42']);
     expect(saved.allowedChatIds).toEqual([CHAT, '-1009']);
     expect(saved.defaultReplyMode).toBe('mention');
     expect(saved.bridgeEnabled).toBe(true);
+    expect(saved.chatPolicies[CHAT]).toEqual({
+      enabled: true,
+      replyMode: 'always',
+      syncProjects: true,
+    });
+    expect(saved.chatPolicies['-1009']).toEqual({ enabled: false });
   });
 
   it('load-config omits the bot token but reports hasToken', async () => {
@@ -223,6 +238,7 @@ describe('messenger /telegram config persistence', () => {
     expect(saved.botToken).toBe('tg-start-token');
     expect(saved.listenerEnabled).toBe(true);
     expect(saved.defaultUserId).toBe('42');
+    expect(saved.ownerUserIds).toEqual(['42']);
   });
 
   it('listener/stop persists the sticky listenerEnabled:false', async () => {
@@ -307,5 +323,166 @@ describe('messenger /config', () => {
     expect(res.status).toBe(200);
     expect(res.body.supportedMessengers).toEqual(['discord', 'telegram']);
     expect(res.body.telegram.maxMessageLength).toBe(4096);
+  });
+});
+
+describe('messenger /telegram/sync-projects', () => {
+  it('requires token and chatId', async () => {
+    const res = await request(createApp().app)
+      .post('/api/messenger/telegram/sync-projects')
+      .send({ projects: [] });
+    expect(res.status).toBe(400);
+  });
+
+  it('posts sync status into a non-forum chat, skips topics, and updates projectBindings', async () => {
+    const persistSettings = vi.fn(async () => {});
+    const readSettings = vi.fn(async () => ({
+      telegram: { botToken: SETTINGS_TOKEN },
+      projects: [{ id: 'p1', path: '/proj/one', name: 'One' }],
+    }));
+
+    stubFetch((url) => {
+      if (url.includes('/getMe')) {
+        return jsonResponse({ ok: true, result: { id: 9911, is_bot: true, username: 'Bot' } });
+      }
+      if (url.includes('/getChat')) {
+        return jsonResponse({ ok: true, result: { id: Number(CHAT), type: 'supergroup', is_forum: false } });
+      }
+      if (url.includes('/sendMessage')) {
+        return jsonResponse({ ok: true, result: { message_id: 77 } });
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const res = await request(createApp({ readSettings, persistSettings }).app)
+      .post('/api/messenger/telegram/sync-projects')
+      .send({
+        chatId: CHAT,
+        summary: 'sync summary',
+        projects: [{ id: 'p1', path: '/proj/one', label: 'One', body: 'status one' }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.isForum).toBe(false);
+    expect(res.body.canManageTopics).toBe(false);
+    expect(res.body.summaryMessageId).toBe(77);
+    expect(res.body.restrictions.some((r) => /not a forum/i.test(r))).toBe(true);
+    expect(res.body.projects).toHaveLength(1);
+    expect(res.body.projects[0]).toMatchObject({
+      projectId: 'p1',
+      projectPath: '/proj/one',
+      messageId: 77,
+      topicCreated: false,
+      topicSkippedReason: 'chat is not a forum',
+      error: null,
+    });
+
+    const sendCalls = fetchCalls.filter((c) => c.url.includes('/sendMessage'));
+    expect(sendCalls.length).toBe(2); // summary + project
+    expect(JSON.parse(sendCalls[0].init.body).chat_id).toBe(CHAT);
+
+    const saved = persistSettings.mock.calls.at(-1)[0].telegram;
+    expect(saved.projectBindings).toEqual([
+      { chatId: CHAT, projectPath: '/proj/one', projectLabel: 'One' },
+    ]);
+  });
+
+  it('creates forum topics when the chat is a forum and the bot can_manage_topics', async () => {
+    const persistSettings = vi.fn(async () => {});
+    const readSettings = vi.fn(async () => ({
+      telegram: { botToken: SETTINGS_TOKEN },
+    }));
+
+    stubFetch((url) => {
+      if (url.includes('/getMe')) {
+        return jsonResponse({ ok: true, result: { id: 9911, is_bot: true, username: 'Bot' } });
+      }
+      if (url.includes('/getChatMember')) {
+        return jsonResponse({
+          ok: true,
+          result: { status: 'administrator', can_manage_topics: true, user: { id: 9911 } },
+        });
+      }
+      if (url.includes('/getChat')) {
+        return jsonResponse({
+          ok: true,
+          result: { id: Number(CHAT), type: 'supergroup', is_forum: true, title: 'Forum' },
+        });
+      }
+      if (url.includes('/createForumTopic')) {
+        return jsonResponse({ ok: true, result: { message_thread_id: 555, name: 'Alpha' } });
+      }
+      if (url.includes('/sendMessage')) {
+        return jsonResponse({ ok: true, result: { message_id: 88 } });
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const res = await request(createApp({ readSettings, persistSettings }).app)
+      .post('/api/messenger/telegram/sync-projects')
+      .send({
+        chatId: CHAT,
+        projects: [{ id: 'a', path: '/a', label: 'Alpha', body: 'alpha body' }],
+      });
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.isForum).toBe(true);
+    expect(res.body.canManageTopics).toBe(true);
+    expect(res.body.projects[0]).toMatchObject({
+      messageThreadId: '555',
+      topicCreated: true,
+      messageId: 88,
+      error: null,
+    });
+    const topicCall = fetchCalls.find((c) => c.url.includes('/createForumTopic'));
+    expect(JSON.parse(topicCall.init.body)).toMatchObject({ chat_id: CHAT, name: 'Alpha' });
+    const projectSend = fetchCalls.filter((c) => c.url.includes('/sendMessage')).at(-1);
+    expect(JSON.parse(projectSend.init.body).message_thread_id).toBe(555);
+
+    const saved = persistSettings.mock.calls.at(-1)[0].telegram;
+    expect(saved.projectBindings[0]).toMatchObject({
+      chatId: CHAT,
+      projectPath: '/a',
+      messageThreadId: '555',
+    });
+  });
+
+  it('reports topic restriction when forum bot lacks can_manage_topics', async () => {
+    const readSettings = vi.fn(async () => ({ telegram: { botToken: SETTINGS_TOKEN } }));
+    stubFetch((url) => {
+      if (url.includes('/getMe')) {
+        return jsonResponse({ ok: true, result: { id: 1, is_bot: true } });
+      }
+      if (url.includes('/getChatMember')) {
+        return jsonResponse({
+          ok: true,
+          result: { status: 'administrator', can_manage_topics: false, user: { id: 1 } },
+        });
+      }
+      if (url.includes('/getChat')) {
+        return jsonResponse({ ok: true, result: { id: Number(CHAT), is_forum: true } });
+      }
+      if (url.includes('/sendMessage')) {
+        return jsonResponse({ ok: true, result: { message_id: 9 } });
+      }
+      if (url.includes('/createForumTopic')) {
+        throw new Error('must not create topics without permission');
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const res = await request(createApp({ readSettings }).app)
+      .post('/api/messenger/telegram/sync-projects')
+      .send({
+        chatId: CHAT,
+        projects: [{ id: 'x', path: '/x', label: 'X', body: 'x' }],
+      });
+
+    expect(res.body.ok).toBe(true);
+    expect(res.body.canManageTopics).toBe(false);
+    expect(res.body.restrictions.some((r) => /can_manage_topics/i.test(r))).toBe(true);
+    expect(res.body.projects[0].topicSkippedReason).toBe('missing can_manage_topics');
+    expect(res.body.projects[0].messageId).toBe(9);
   });
 });

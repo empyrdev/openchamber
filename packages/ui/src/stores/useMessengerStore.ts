@@ -13,6 +13,7 @@ export type MessengerVerbosity = 'quiet' | 'normal' | 'verbose';
 export type MessengerPermissionMode = 'ask' | 'yolo' | 'agent';
 
 export type DiscordReplyMode = 'always' | 'mention' | 'inherit';
+export type TelegramReplyMode = 'always' | 'mention' | 'inherit';
 
 /**
  * Per-server (guild) configuration. A single object holds both how the bot
@@ -34,6 +35,26 @@ export interface DiscordGuildPolicy {
   parentCategoryId?: string;
   /** Start a thread from each project status message, in this server. */
   createThreads?: boolean;
+}
+
+/**
+ * Per-chat Telegram policy — Discord guildPolicies analogue for groups/DMs the
+ * bot has seen or that are listed in allowedChatIds.
+ */
+export interface TelegramChatPolicy {
+  /** Respond in this chat. When false, muted like a Discord guild. */
+  enabled?: boolean;
+  /** How the bot decides to reply. `inherit` uses telegramDefaultReplyMode. */
+  replyMode?: TelegramReplyMode;
+  /** Include this chat when Sync Now mirrors projects. */
+  syncProjects?: boolean;
+}
+
+export interface TelegramProjectBinding {
+  chatId: string;
+  projectPath: string;
+  projectLabel?: string;
+  messageThreadId?: string;
 }
 
 /** Cached channel/category topology for one guild, from `resolve-guild`. */
@@ -138,6 +159,20 @@ export interface MessengerConnection {
     /** Thread-level error only — channel + message still succeeded. */
     threadError?: string | null;
   }[];
+  /** Per-project results from the most recent Telegram chat sync. */
+  lastSyncTelegramProjects?: {
+    projectId: string;
+    projectPath?: string | null;
+    projectLabel: string;
+    chatId?: string;
+    messageThreadId?: string | null;
+    messageId?: string | number | null;
+    topicCreated?: boolean;
+    topicSkippedReason?: string | null;
+    error?: string | null;
+  }[];
+  /** Restriction hints from the last Telegram sync (privacy / topics / admin). */
+  lastSyncTelegramRestrictions?: string[];
 
   // Discord Gateway listener state.
   /**
@@ -190,9 +225,20 @@ export interface MessengerConnection {
   telegramCanReadAllGroupMessages?: boolean | null;
   /** Default Telegram chat id that test messages are sent to. */
   defaultChatId?: string;
+  /**
+   * Telegram user ids of bot owners. In groups, only listed owners can talk
+   * to the bot. Loaded from `ownerUserIds` or legacy `defaultUserId`.
+   */
+  telegramOwnerUserIds?: string[];
   /** Optional allow-list of chat ids the bot answers in (empty = all chats). */
   telegramAllowedChatIds?: string[];
   telegramDefaultReplyMode?: 'always' | 'mention';
+  /** Per-chat mute / reply / sync policy (Discord guildPolicies analogue). */
+  telegramChatPolicies?: Record<string, TelegramChatPolicy>;
+  /** Persisted chat → project bindings from Sync Now (optional forum topic id). */
+  telegramProjectBindings?: TelegramProjectBinding[];
+  /** Cached titles for chats discovered via inbound / allow-list. */
+  telegramChatTitles?: Record<string, string>;
   telegramListenerEnabled?: boolean;
   telegramListenerRunning?: boolean;
   telegramListenerConnected?: boolean;
@@ -412,7 +458,12 @@ interface MessengerState {
     summary: string,
     opts?: { guildIds?: string[] },
   ) => Promise<boolean>;
-  sendTestMessage: (type: MessengerType, opts?: { guildId?: string }) => Promise<boolean>;
+  syncTelegramChatProjects: (
+    projects: { id: string; path?: string; label: string; body: string }[],
+    summary: string,
+    opts: { chatId: string; messageThreadId?: string | number | null },
+  ) => Promise<boolean>;
+  sendTestMessage: (type: MessengerType, opts?: { guildId?: string; chatId?: string }) => Promise<boolean>;
   diagnoseDiscord: () => Promise<boolean>;
   refreshBridgeStatus: (type?: MessengerType) => Promise<void>;
   setBridgeVerbosity: (type: MessengerType, level: MessengerVerbosity) => Promise<boolean>;
@@ -445,6 +496,10 @@ interface MessengerState {
   setDiscordGuildPolicy: (
     guildId: string,
     patch: Partial<DiscordGuildPolicy>,
+  ) => void;
+  setTelegramChatPolicy: (
+    chatId: string,
+    patch: Partial<TelegramChatPolicy>,
   ) => void;
   setDiscordDefaultReplyMode: (mode: 'always' | 'mention') => void;
   /**
@@ -781,7 +836,12 @@ type TelegramListenerStatusPayload = {
   lastError?: string | null;
   defaultReplyMode?: 'always' | 'mention';
   defaultChatId?: string;
+  defaultUserId?: string;
+  ownerUserId?: string;
+  ownerUserIds?: string[];
   allowedChatIds?: string[];
+  chatPolicies?: Record<string, TelegramChatPolicy>;
+  projectBindings?: TelegramProjectBinding[];
 };
 
 type TelegramTestPayload = {
@@ -959,6 +1019,60 @@ export function isDiscordGuildSyncing(
   const anyExplicit = Object.values(policies).some((p) => p?.syncProjects);
   if (anyExplicit) return Boolean(policies[guildId]?.syncProjects);
   return guildId === conn.discordGuildId;
+}
+
+/** Whether a Telegram chat has "Sync projects" enabled. */
+export function isTelegramChatSyncing(
+  conn: Pick<MessengerConnection, 'telegramChatPolicies'>,
+  chatId: string,
+): boolean {
+  return Boolean(conn.telegramChatPolicies?.[chatId]?.syncProjects);
+}
+
+/**
+ * Build the Discord-like list of Telegram chats from allow-list, recent
+ * inbound messages, saved policies, and project bindings.
+ */
+export function listTelegramManagedChats(
+  conn: Pick<
+    MessengerConnection,
+    | 'telegramAllowedChatIds'
+    | 'telegramChatPolicies'
+    | 'telegramProjectBindings'
+    | 'telegramChatTitles'
+    | 'defaultChatId'
+  >,
+  inbound: MessengerInboundMessage[] = [],
+): { id: string; title: string; chatType: string | null }[] {
+  const titles = { ...(conn.telegramChatTitles ?? {}) };
+  const types = new Map<string, string | null>();
+  for (const msg of inbound) {
+    if (msg.chatId == null) continue;
+    const id = String(msg.chatId);
+    if (msg.chatTitle) titles[id] = msg.chatTitle;
+    if (msg.chatType) types.set(id, msg.chatType);
+  }
+  const ids = new Set<string>();
+  for (const id of conn.telegramAllowedChatIds ?? []) {
+    if (id) ids.add(String(id));
+  }
+  for (const id of Object.keys(conn.telegramChatPolicies ?? {})) {
+    if (id) ids.add(String(id));
+  }
+  for (const binding of conn.telegramProjectBindings ?? []) {
+    if (binding?.chatId) ids.add(String(binding.chatId));
+  }
+  if (conn.defaultChatId) ids.add(String(conn.defaultChatId));
+  for (const msg of inbound) {
+    if (msg.chatId != null) ids.add(String(msg.chatId));
+  }
+  return Array.from(ids)
+    .sort((a, b) => a.localeCompare(b))
+    .map((id) => ({
+      id,
+      title: titles[id] || id,
+      chatType: types.get(id) ?? null,
+    }));
 }
 
 /** The set of server ids that should receive per-project channel mirroring. */
@@ -1387,6 +1501,122 @@ export const useMessengerStore = create<MessengerState>()(
         return !hadError;
       },
 
+      syncTelegramChatProjects: async (projects, summary, opts) => {
+        const conn = get().connections.find((c) => c.type === 'telegram');
+        if (!conn || (!conn.botToken && !conn.telegramServerConfigured)) {
+          get().updateConnection('telegram', {
+            lastSyncStatus: 'error',
+            lastSyncMessage: 'Connect Telegram before syncing projects',
+          });
+          return false;
+        }
+        const chatId = opts?.chatId ? String(opts.chatId) : '';
+        if (!chatId) {
+          get().updateConnection('telegram', {
+            lastSyncStatus: 'error',
+            lastSyncMessage: 'Pick a Telegram chat to sync into',
+          });
+          return false;
+        }
+
+        get().updateConnection('telegram', {
+          lastSyncStatus: 'sending',
+          lastSyncMessage:
+            projects.length > 0
+              ? `Syncing ${projects.length} project${projects.length === 1 ? '' : 's'} to Telegram…`
+              : 'Sending sync summary…',
+          lastSyncTelegramRestrictions: [],
+          lastSyncTelegramProjects: [],
+        });
+
+        try {
+          const data = await postJson<{
+            ok: boolean;
+            error?: string;
+            restrictions?: string[];
+            projects?: NonNullable<MessengerConnection['lastSyncTelegramProjects']>;
+            summaryMessageId?: number | null;
+          }>('/api/messenger/telegram/sync-projects', {
+            ...(conn.botToken ? { token: conn.botToken } : {}),
+            chatId,
+            ...(opts.messageThreadId != null ? { messageThreadId: opts.messageThreadId } : {}),
+            summary,
+            projects,
+          });
+
+          const rows = (data.projects ?? []).map((r) => ({ ...r, chatId }));
+          const restrictions = Array.isArray(data.restrictions) ? data.restrictions : [];
+          const errored = rows.filter((r) => r.error);
+          const posted = rows.filter((r) => r.messageId).length;
+          const topics = rows.filter((r) => r.topicCreated).length;
+          const parts: string[] = [];
+          if (posted > 0) parts.push(`${posted} message${posted === 1 ? '' : 's'} posted`);
+          if (topics > 0) parts.push(`${topics} topic${topics === 1 ? '' : 's'} created`);
+          if (errored.length > 0) parts.push(`${errored.length} error${errored.length === 1 ? '' : 's'}`);
+          if (restrictions.length > 0) parts.push(`${restrictions.length} restriction${restrictions.length === 1 ? '' : 's'}`);
+          const summaryMsg = parts.length > 0 ? `${parts.join(', ')}` : 'Sync sent';
+
+          // Refresh bindings from server load-config so UI shows persisted rows.
+          let nextBindings = conn.telegramProjectBindings ?? [];
+          try {
+            const loaded = await getJson<{
+              ok: boolean;
+              config?: { projectBindings?: TelegramProjectBinding[] } | null;
+            }>('/api/messenger/telegram/load-config');
+            if (loaded.ok && Array.isArray(loaded.config?.projectBindings)) {
+              nextBindings = loaded.config.projectBindings;
+            } else {
+              // Optimistic merge from this sync's successful rows.
+              const incoming = rows
+                .filter((r) => r.projectPath && !r.error)
+                .map((r) => ({
+                  chatId,
+                  projectPath: String(r.projectPath),
+                  projectLabel: r.projectLabel,
+                  ...(r.messageThreadId != null
+                    ? { messageThreadId: String(r.messageThreadId) }
+                    : {}),
+                }));
+              const byKey = new Map<string, TelegramProjectBinding>();
+              for (const b of nextBindings) {
+                const key = b.messageThreadId
+                  ? `${b.chatId}:thread:${b.messageThreadId}`
+                  : `${b.chatId}:path:${b.projectPath}`;
+                byKey.set(key, b);
+              }
+              for (const b of incoming) {
+                const key = b.messageThreadId
+                  ? `${b.chatId}:thread:${b.messageThreadId}`
+                  : `${b.chatId}:path:${b.projectPath}`;
+                byKey.set(key, b);
+              }
+              nextBindings = Array.from(byKey.values());
+            }
+          } catch {
+            // keep prior bindings
+          }
+
+          const hadError = Boolean(data.error) || errored.length > 0 || data.ok === false;
+          get().updateConnection('telegram', {
+            lastSyncAt: Date.now(),
+            lastSyncStatus: hadError ? 'error' : 'ok',
+            lastSyncMessage: hadError
+              ? `${summaryMsg} — ${errored[0]?.error ?? data.error ?? 'sync failed'}`
+              : `${summaryMsg} ✓`,
+            lastSyncTelegramProjects: rows,
+            lastSyncTelegramRestrictions: restrictions,
+            telegramProjectBindings: nextBindings,
+          });
+          return !hadError;
+        } catch (e) {
+          get().updateConnection('telegram', {
+            lastSyncStatus: 'error',
+            lastSyncMessage: e instanceof Error ? e.message : 'Sync failed',
+          });
+          return false;
+        }
+      },
+
       fetchDiscordInviteUrl: async () => {
         const conn = get().connections.find((c) => c.type === 'discord');
         if (!conn?.discordBotId) return null;
@@ -1416,7 +1646,7 @@ export const useMessengerStore = create<MessengerState>()(
             });
             return false;
           }
-          const target = conn.defaultChatId;
+          const target = opts?.chatId || conn.defaultChatId;
           if (!target) {
             get().updateConnection(type, {
               lastSyncStatus: 'error',
@@ -1924,6 +2154,21 @@ export const useMessengerStore = create<MessengerState>()(
         }
       },
 
+      setTelegramChatPolicy: (chatId, patch) => {
+        const conn = get().connections.find((c) => c.type === 'telegram');
+        if (!conn || !chatId) return;
+        const prev = conn.telegramChatPolicies ?? {};
+        const existing = prev[chatId] ?? {};
+        const nextPolicy = { ...existing, ...patch };
+        get().updateConnection('telegram', {
+          telegramChatPolicies: {
+            ...prev,
+            [chatId]: nextPolicy,
+          },
+        });
+        setTimeout(() => void get().saveTelegramConfig(), 0);
+      },
+
       setDiscordDefaultReplyMode: (mode) => {
         get().updateConnection('discord', { discordDefaultReplyMode: mode });
         setTimeout(() => get().saveDiscordConfig(), 0);
@@ -2129,14 +2374,21 @@ export const useMessengerStore = create<MessengerState>()(
         // save: the server falls back to the settings.json token when the body
         // omits botToken — same contract as saveDiscordConfig.
         if (!conn.botToken && !conn.telegramServerConfigured) return;
+        const ownerUserIds =
+          conn.telegramOwnerUserIds ??
+          (conn.defaultUserId ? [conn.defaultUserId] : []);
         try {
           await postJson('/api/messenger/telegram/save-config', {
             ...(conn.botToken ? { botToken: conn.botToken } : {}),
             autoReply: true,
             defaultChatId: conn.defaultChatId,
-            defaultUserId: conn.defaultUserId,
+            ownerUserIds,
+            // First owner kept as defaultUserId for older server / listener compat.
+            defaultUserId: ownerUserIds[0],
             allowedChatIds: conn.telegramAllowedChatIds ?? [],
             defaultReplyMode: conn.telegramDefaultReplyMode ?? 'always',
+            chatPolicies: conn.telegramChatPolicies ?? {},
+            projectBindings: conn.telegramProjectBindings ?? [],
           });
         } catch {
           // silent — config save is best-effort
@@ -2148,6 +2400,9 @@ export const useMessengerStore = create<MessengerState>()(
         // Tokenless start is allowed — the endpoint falls back to the token
         // saved in settings.json (same pattern as /test and /listener/stop).
         if (!conn?.botToken && !conn?.telegramServerConfigured) return false;
+        const ownerUserIds =
+          conn.telegramOwnerUserIds ??
+          (conn.defaultUserId ? [conn.defaultUserId] : []);
         try {
           const data = await postJson<{
             ok: boolean;
@@ -2163,9 +2418,11 @@ export const useMessengerStore = create<MessengerState>()(
           }>('/api/messenger/telegram/listener/start', {
             ...(conn.botToken ? { token: conn.botToken } : {}),
             defaultChatId: conn.defaultChatId,
-            defaultUserId: conn.defaultUserId,
+            ownerUserIds,
+            defaultUserId: ownerUserIds[0],
             allowedChatIds: conn.telegramAllowedChatIds ?? [],
             defaultReplyMode: conn.telegramDefaultReplyMode ?? 'always',
+            chatPolicies: conn.telegramChatPolicies ?? {},
           });
           if (!data.ok) return false;
           get().updateConnection('telegram', {
@@ -2283,6 +2540,24 @@ export const useMessengerStore = create<MessengerState>()(
           if (Array.isArray(data.allowedChatIds) && !conn?.telegramAllowedChatIds) {
             updates.telegramAllowedChatIds = data.allowedChatIds;
           }
+          if (data.chatPolicies && typeof data.chatPolicies === 'object') {
+            updates.telegramChatPolicies = data.chatPolicies;
+          }
+          if (Array.isArray(data.projectBindings)) {
+            updates.telegramProjectBindings = data.projectBindings;
+          }
+          // Prefer ownerUserIds; fall back to legacy single defaultUserId / ownerUserId.
+          if (!conn?.telegramOwnerUserIds?.length) {
+            const loadedOwners = Array.isArray(data.ownerUserIds)
+              ? data.ownerUserIds.filter(Boolean)
+              : [data.ownerUserId ?? data.defaultUserId].filter(
+                  (id): id is string => typeof id === 'string' && id.trim().length > 0,
+                );
+            if (loadedOwners.length > 0) {
+              updates.telegramOwnerUserIds = loadedOwners;
+              updates.defaultUserId = loadedOwners[0];
+            }
+          }
           if (data.botId) updates.telegramBotId = data.botId;
           if (data.botUsername) updates.telegramBotUsername = data.botUsername;
           // Authoritative live listener → keep the header badge in sync even
@@ -2359,6 +2634,18 @@ export const useMessengerStore = create<MessengerState>()(
         const cur = get().telegramInbound;
         const next = [msg, ...cur.filter((m) => m.updateId !== msg.updateId)].slice(0, 50);
         set({ telegramInbound: next });
+        if (msg.chatId != null && msg.chatTitle) {
+          const conn = get().connections.find((c) => c.type === 'telegram');
+          if (conn) {
+            const chatId = String(msg.chatId);
+            const prevTitles = conn.telegramChatTitles ?? {};
+            if (prevTitles[chatId] !== msg.chatTitle) {
+              get().updateConnection('telegram', {
+                telegramChatTitles: { ...prevTitles, [chatId]: msg.chatTitle },
+              });
+            }
+          }
+        }
       },
 
       loadDiscordHistory: async (channelId, limit = 50) => {
@@ -2754,14 +3041,36 @@ export const useMessengerStore = create<MessengerState>()(
         })),
         projectMappings: state.projectMappings,
       }),
-      merge: (persistedState: unknown, currentState: MessengerState): MessengerState => ({
-        ...currentState,
-        ...(persistedState as Partial<MessengerState>),
-        // Mark the store fully rehydrated so the settings UI won't flash
-        // the "Connect Discord" tile on every reload while waiting for
-        // localStorage.
-        hasHydrated: true,
-      }),
+      merge: (persistedState: unknown, currentState: MessengerState): MessengerState => {
+        const persisted = (persistedState as Partial<MessengerState>) ?? {};
+        const connections = (persisted.connections ?? currentState.connections).map((c) => {
+          if (c.type !== 'telegram') return c;
+          if (c.telegramOwnerUserIds?.length) {
+            return {
+              ...c,
+              defaultUserId: c.telegramOwnerUserIds[0] ?? c.defaultUserId,
+            };
+          }
+          const legacyOwners = [c.defaultUserId].filter(
+            (id): id is string => typeof id === 'string' && id.trim().length > 0,
+          );
+          if (legacyOwners.length === 0) return c;
+          return {
+            ...c,
+            telegramOwnerUserIds: legacyOwners,
+            defaultUserId: legacyOwners[0],
+          };
+        });
+        return {
+          ...currentState,
+          ...persisted,
+          connections,
+          // Mark the store fully rehydrated so the settings UI won't flash
+          // the "Connect Discord" tile on every reload while waiting for
+          // localStorage.
+          hasHydrated: true,
+        };
+      },
       onRehydrateStorage: () => () => {
         // Always unblock the Integrations UI — even when rehydrate fails.
         useMessengerStore.setState({ hasHydrated: true });

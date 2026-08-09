@@ -10,8 +10,12 @@ import {
   telegramApi,
   sendTelegramMessage,
   friendlyTelegramError,
+  getTelegramChat,
+  getTelegramChatMember,
+  createTelegramForumTopic,
+  telegramMemberCanManageTopics,
 } from './telegram-api.js';
-import { normalizeTelegramChatIds } from './telegram-access.js';
+import { normalizeTelegramChatIds, normalizeTelegramAccessSettings } from './telegram-access.js';
 import { createMessengerOpencodeBridge } from './messenger-opencode-bridge.js';
 import { createDiscordAgentRouter } from './discord-agent-api.js';
 import { parseVerbosityLevel, VERBOSITY_LEVELS } from './messenger-verbosity.js';
@@ -28,6 +32,24 @@ import {
   normalizeMessengerInterruptTimeoutMs,
 } from './messenger-bridge-store.js';
 import { resolvePrimaryWorktreeRoot } from '../git/service.js';
+
+/**
+ * Resolve owner user ids for Telegram persistence / listener start.
+ * Accepts ownerUserIds and/or legacy defaultUserId; always returns both
+ * ownerUserIds and defaultUserId (first owner) for back-compat.
+ */
+function resolveTelegramOwnerFields(input = {}, prev = {}) {
+  const hasOwnerUserIds = Object.prototype.hasOwnProperty.call(input, 'ownerUserIds');
+  const access = normalizeTelegramAccessSettings({
+    ownerUserIds: hasOwnerUserIds ? input.ownerUserIds : prev.ownerUserIds,
+    defaultUserId: input.defaultUserId || prev.defaultUserId,
+    ownerUserId: input.ownerUserId,
+  });
+  return {
+    ownerUserIds: access.ownerUserIds.length > 0 ? access.ownerUserIds : undefined,
+    defaultUserId: access.ownerUserId || undefined,
+  };
+}
 
 /**
  * Messenger sync routes for Discord.
@@ -232,6 +254,36 @@ export function mergeProjectBindings(prev, incoming) {
   return Array.from(byChannel.values());
 }
 
+/**
+ * Merge Telegram project bindings. Forum topics key by chatId+messageThreadId;
+ * non-forum multi-project rows key by chatId+projectPath so they do not collide.
+ * Exported for testing.
+ */
+export function mergeTelegramProjectBindings(prev, incoming) {
+  const byKey = new Map();
+  const add = (list) => {
+    for (const b of Array.isArray(list) ? list : []) {
+      if (!b || !b.chatId || !b.projectPath) continue;
+      const chatId = String(b.chatId);
+      const projectPath = String(b.projectPath);
+      const messageThreadId =
+        b.messageThreadId != null && String(b.messageThreadId).length > 0
+          ? String(b.messageThreadId)
+          : undefined;
+      const key = messageThreadId ? `${chatId}:thread:${messageThreadId}` : `${chatId}:path:${projectPath}`;
+      byKey.set(key, {
+        chatId,
+        projectPath,
+        projectLabel: b.projectLabel ? String(b.projectLabel) : undefined,
+        ...(messageThreadId ? { messageThreadId } : {}),
+      });
+    }
+  };
+  add(prev);
+  add(incoming);
+  return Array.from(byKey.values());
+}
+
 /** Inverse of `slugifyProjectLabel` — best-effort human label from a channel name. */
 function labelFromChannelName(name) {
   return (
@@ -400,6 +452,35 @@ export function createMessengerSyncRouter({
         : [],
     );
     return ({ channelId }) => bindingMap.get(String(channelId)) ?? null;
+  }
+
+  /** Telegram chat/topic → project resolver (uses chatId + optional messageThreadId). */
+  function buildTelegramResolveProject(projectBindings) {
+    const bindings = Array.isArray(projectBindings) ? projectBindings : [];
+    return ({ chatId, channelId, threadId } = {}) => {
+      const id = String(chatId ?? channelId ?? '');
+      if (!id) return null;
+      const threadKey = threadId != null && String(threadId).length > 0 ? String(threadId) : null;
+      if (threadKey) {
+        const threaded = bindings.find(
+          (b) =>
+            b &&
+            String(b.chatId) === id &&
+            b.messageThreadId != null &&
+            String(b.messageThreadId) === threadKey,
+        );
+        if (threaded?.projectPath) {
+          return { path: threaded.projectPath, label: threaded.projectLabel ?? null };
+        }
+      }
+      const chatLevel = bindings.find(
+        (b) => b && String(b.chatId) === id && (b.messageThreadId == null || b.messageThreadId === ''),
+      );
+      if (chatLevel?.projectPath) {
+        return { path: chatLevel.projectPath, label: chatLevel.projectLabel ?? null };
+      }
+      return null;
+    };
   }
 
   async function resolveDefaultDiscordTarget({ projectPath } = {}) {
@@ -2979,6 +3060,226 @@ export function createMessengerSyncRouter({
   });
 
   /**
+   * Telegram multi-group project sync — Bot API analogue of Discord
+   * `/discord/sync-projects`. Posts a sync status message into the chat
+   * (optionally into an existing message_thread_id). When the chat is a forum
+   * and the bot can_manage_topics, creates one forum topic per project;
+   * otherwise skips topic creation and reports the restriction. Updates
+   * settings.telegram.projectBindings. Does NOT invent Discord-style channels.
+   *
+   * Body: { token?, chatId, messageThreadId?, summary?, projects: [{ id, path?, label?, body? }] }
+   */
+  router.post('/telegram/sync-projects', async (req, res) => {
+    const { chatId, messageThreadId, summary, projects } = req.body ?? {};
+    const token = await resolveTelegramBotToken(req.body?.token);
+    if (!token || chatId == null || String(chatId).trim() === '') {
+      return res.status(400).json({ error: 'token and chatId required' });
+    }
+    const targetChatId = String(chatId).trim();
+    const projectList = Array.isArray(projects) ? projects : [];
+    const restrictions = [];
+
+    // Resolve project paths from settings when the client omits them (older UI).
+    const settingsProjectPathById = new Map();
+    let prevTelegram = {};
+    if (readSettings) {
+      try {
+        const settings = await readSettings();
+        prevTelegram = settings?.telegram ?? {};
+        for (const project of Array.isArray(settings?.projects) ? settings.projects : []) {
+          if (project?.id && project?.path) {
+            settingsProjectPathById.set(String(project.id), String(project.path));
+          }
+        }
+      } catch {
+        // best-effort
+      }
+    }
+
+    // Detect forum + manage_topics capability. Failures are non-fatal — we still
+    // post messages into the chat; topic creation is simply skipped.
+    let isForum = false;
+    let canManageTopics = false;
+    let botUserId = null;
+    try {
+      const me = await telegramApi(token, 'getMe', {});
+      if (me.ok) {
+        botUserId = me.body?.result?.id ?? null;
+      }
+    } catch {
+      // ignore
+    }
+    const chatInfo = await getTelegramChat({ token, chatId: targetChatId });
+    if (chatInfo.ok && chatInfo.chat) {
+      isForum = Boolean(chatInfo.chat.is_forum);
+    } else if (!chatInfo.ok) {
+      restrictions.push(`getChat failed: ${chatInfo.error ?? 'unknown'}`);
+    }
+    if (isForum && botUserId != null) {
+      const memberInfo = await getTelegramChatMember({
+        token,
+        chatId: targetChatId,
+        userId: botUserId,
+      });
+      if (memberInfo.ok) {
+        canManageTopics = telegramMemberCanManageTopics(memberInfo.member);
+        if (!canManageTopics) {
+          restrictions.push(
+            'Bot lacks can_manage_topics — promote the bot to admin with Manage Topics to create forum topics per project.',
+          );
+        }
+      } else {
+        restrictions.push(
+          `Could not verify topic permissions: ${memberInfo.error ?? 'unknown'}`,
+        );
+      }
+    } else if (!isForum) {
+      restrictions.push(
+        'Chat is not a forum — project topics were skipped; status messages post into the chat itself.',
+      );
+    }
+
+    let summaryMessageId = null;
+    if (summary && String(summary).trim().length > 0) {
+      const summarySend = await sendTelegramMessage({
+        token,
+        chatId: targetChatId,
+        text: String(summary).slice(0, 4096),
+        messageThreadId: messageThreadId ?? null,
+      });
+      if (summarySend.ok) {
+        summaryMessageId = summarySend.messageId;
+      } else {
+        restrictions.push(`Summary message failed: ${summarySend.error ?? 'unknown'}`);
+      }
+    }
+
+    const projectResults = [];
+    for (let projectIndex = 0; projectIndex < projectList.length; projectIndex++) {
+      const project = projectList[projectIndex];
+      if (projectIndex > 0) {
+        await sleep(SYNC_PROJECT_DELAY_MS);
+      }
+      const label = project.label || `Project ${project.id}`;
+      const projectPath =
+        typeof project.path === 'string' && project.path
+          ? project.path
+          : settingsProjectPathById.get(String(project.id)) ?? null;
+
+      let topicThreadId = messageThreadId != null ? Number(messageThreadId) || messageThreadId : null;
+      let topicCreated = false;
+      let topicSkippedReason = null;
+      let entryError = null;
+
+      // Prefer reusing an existing binding's forum topic for this project+chat.
+      const existingBindings = Array.isArray(prevTelegram.projectBindings)
+        ? prevTelegram.projectBindings
+        : [];
+      const existing = existingBindings.find(
+        (b) =>
+          b &&
+          String(b.chatId) === targetChatId &&
+          String(b.projectPath) === String(projectPath ?? '') &&
+          b.messageThreadId != null,
+      );
+      if (existing?.messageThreadId != null && topicThreadId == null) {
+        topicThreadId = existing.messageThreadId;
+      }
+
+      if (isForum && canManageTopics && topicThreadId == null) {
+        const created = await createTelegramForumTopic({
+          token,
+          chatId: targetChatId,
+          name: label,
+        });
+        if (created.ok && created.messageThreadId != null) {
+          topicThreadId = created.messageThreadId;
+          topicCreated = true;
+        } else {
+          topicSkippedReason = created.error ?? 'createForumTopic failed';
+        }
+      } else if (isForum && !canManageTopics && topicThreadId == null) {
+        topicSkippedReason = 'missing can_manage_topics';
+      } else if (!isForum) {
+        topicSkippedReason = 'chat is not a forum';
+      }
+
+      let messageId = null;
+      const body =
+        typeof project.body === 'string' && project.body.trim().length > 0
+          ? project.body
+          : `OpenChamber agent sync update for ${label}`;
+      const send = await sendTelegramMessage({
+        token,
+        chatId: targetChatId,
+        text: String(body).slice(0, 4096),
+        messageThreadId: topicThreadId,
+      });
+      if (send.ok) {
+        messageId = send.messageId;
+      } else {
+        entryError = send.error ?? 'sendMessage failed';
+      }
+
+      projectResults.push({
+        projectId: project.id,
+        projectPath,
+        projectLabel: label,
+        messageThreadId: topicThreadId != null ? String(topicThreadId) : null,
+        messageId,
+        topicCreated,
+        topicSkippedReason,
+        error: entryError,
+      });
+    }
+
+    if (persistSettings) {
+      const newBindings = projectResults
+        .filter((row) => row.projectPath && !row.error)
+        .map((row) => ({
+          chatId: targetChatId,
+          projectPath: String(row.projectPath),
+          projectLabel: row.projectLabel ? String(row.projectLabel) : undefined,
+          ...(row.messageThreadId != null
+            ? { messageThreadId: String(row.messageThreadId) }
+            : {}),
+        }));
+      if (newBindings.length > 0) {
+        try {
+          const current = readSettings ? await readSettings() : null;
+          const prev = current?.telegram ?? {};
+          await persistSettings({
+            telegram: {
+              ...prev,
+              botToken: token || prev.botToken || undefined,
+              projectBindings: mergeTelegramProjectBindings(prev.projectBindings, newBindings),
+            },
+          });
+        } catch {
+          // best-effort — sync succeeded, settings persistence failed
+        }
+      }
+    }
+
+    broadcastEvent?.('messenger.telegram.synced', {
+      chatId: targetChatId,
+      projectCount: projectList.length,
+      topicsCreated: projectResults.filter((r) => r.topicCreated).length,
+      errors: projectResults.filter((r) => r.error).length,
+    });
+
+    res.json({
+      ok: projectResults.every((r) => !r.error),
+      chatId: targetChatId,
+      summaryMessageId,
+      isForum,
+      canManageTopics,
+      restrictions,
+      projects: projectResults,
+    });
+  });
+
+  /**
    * Telegram listener lifecycle — mirrors the /discord/listener/* family so
    * the Settings UI drives both platforms through the same flow. Config
    * persists to settings.json under `telegram` for boot auto-start.
@@ -2988,16 +3289,41 @@ export function createMessengerSyncRouter({
       autoReply,
       defaultChatId,
       defaultUserId,
+      ownerUserIds,
       allowedChatIds,
       defaultReplyMode,
+      chatPolicies,
     } = req.body ?? {};
     const token = await resolveTelegramBotToken(req.body?.token);
     if (!token) return res.status(400).json({ error: 'token required' });
+
+    let prev = {};
+    if (readSettings) {
+      try {
+        const current = await readSettings();
+        prev = current?.telegram ?? {};
+      } catch {
+        prev = {};
+      }
+    }
+    const owners = resolveTelegramOwnerFields(
+      { defaultUserId, ownerUserIds, ownerUserId: req.body?.ownerUserId },
+      prev,
+    );
+    const resolvedChatPolicies =
+      chatPolicies && typeof chatPolicies === 'object' && !Array.isArray(chatPolicies)
+        ? chatPolicies
+        : prev.chatPolicies && typeof prev.chatPolicies === 'object'
+          ? prev.chatPolicies
+          : {};
     const result = telegramListener.start(token, {
       autoReply: autoReply !== false,
-      defaultUserId,
+      defaultUserId: owners.defaultUserId,
+      ownerUserIds: owners.ownerUserIds,
       allowedChatIds,
       defaultReplyMode,
+      chatPolicies: resolvedChatPolicies,
+      resolveProject: buildTelegramResolveProject(prev.projectBindings),
     });
 
     // The bridge mirrors OpenCode output via the shared global event hub —
@@ -3014,9 +3340,8 @@ export function createMessengerSyncRouter({
     // the Discord start route.
     if (persistSettings) {
       try {
-        const current = readSettings ? await readSettings() : null;
-        const prev = current?.telegram ?? {};
         const hasAllowedChatIds = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'allowedChatIds');
+        const hasChatPolicies = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'chatPolicies');
         await persistSettings({
           telegram: {
             ...prev,
@@ -3028,7 +3353,8 @@ export function createMessengerSyncRouter({
             // undone by a later start-config merge that omitted the flag.
             listenerEnabled: true,
             defaultChatId: defaultChatId || prev.defaultChatId || undefined,
-            defaultUserId: defaultUserId || prev.defaultUserId || undefined,
+            defaultUserId: owners.defaultUserId,
+            ownerUserIds: owners.ownerUserIds,
             allowedChatIds: hasAllowedChatIds
               ? normalizeTelegramChatIds(allowedChatIds)
               : prev.allowedChatIds || undefined,
@@ -3036,6 +3362,7 @@ export function createMessengerSyncRouter({
               defaultReplyMode === 'always' || defaultReplyMode === 'mention'
                 ? defaultReplyMode
                 : prev.defaultReplyMode || undefined,
+            chatPolicies: hasChatPolicies ? resolvedChatPolicies : prev.chatPolicies || undefined,
           },
         });
       } catch {
@@ -3111,7 +3438,22 @@ export function createMessengerSyncRouter({
         ...telegramListener.status(token),
         defaultReplyMode: telegram.defaultReplyMode === 'mention' ? 'mention' : 'always',
         defaultChatId: telegram.defaultChatId ?? undefined,
+        // Prefer live listener owners; fall back to persisted settings so the
+        // UI can hydrate telegramOwnerUserIds when the listener is stopped.
+        ...(() => {
+          const owners = resolveTelegramOwnerFields(telegram, telegram);
+          return {
+            ownerUserIds: owners.ownerUserIds,
+            defaultUserId: owners.defaultUserId,
+            ownerUserId: owners.defaultUserId,
+          };
+        })(),
         allowedChatIds: Array.isArray(telegram.allowedChatIds) ? telegram.allowedChatIds : undefined,
+        chatPolicies:
+          telegram.chatPolicies && typeof telegram.chatPolicies === 'object'
+            ? telegram.chatPolicies
+            : undefined,
+        projectBindings: Array.isArray(telegram.projectBindings) ? telegram.projectBindings : undefined,
       });
     } catch (err) {
       return res.status(500).json({ ok: false, error: err?.message ?? 'status failed' });
@@ -3158,13 +3500,29 @@ export function createMessengerSyncRouter({
       autoReply,
       defaultChatId,
       defaultUserId,
+      ownerUserIds,
       allowedChatIds,
       defaultReplyMode,
+      chatPolicies,
+      projectBindings,
     } = req.body ?? {};
     try {
       const current = readSettings ? await readSettings() : null;
       const prev = current?.telegram ?? {};
       const hasAllowedChatIds = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'allowedChatIds');
+      const hasChatPolicies = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'chatPolicies');
+      const hasProjectBindings = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'projectBindings');
+      const owners = resolveTelegramOwnerFields(
+        { defaultUserId, ownerUserIds, ownerUserId: req.body?.ownerUserId },
+        prev,
+      );
+      const resolvedChatPolicies =
+        chatPolicies && typeof chatPolicies === 'object' && !Array.isArray(chatPolicies)
+          ? chatPolicies
+          : prev.chatPolicies || undefined;
+      const resolvedProjectBindings = hasProjectBindings
+        ? mergeTelegramProjectBindings([], projectBindings)
+        : prev.projectBindings || undefined;
       await persistSettings({
         telegram: {
           ...prev,
@@ -3172,7 +3530,8 @@ export function createMessengerSyncRouter({
           autoReply: autoReply !== false,
           bridgeEnabled: true,
           defaultChatId: defaultChatId || prev.defaultChatId || undefined,
-          defaultUserId: defaultUserId || prev.defaultUserId || undefined,
+          defaultUserId: owners.defaultUserId,
+          ownerUserIds: owners.ownerUserIds,
           allowedChatIds: hasAllowedChatIds
             ? normalizeTelegramChatIds(allowedChatIds)
             : prev.allowedChatIds || undefined,
@@ -3180,6 +3539,8 @@ export function createMessengerSyncRouter({
             defaultReplyMode === 'always' || defaultReplyMode === 'mention'
               ? defaultReplyMode
               : prev.defaultReplyMode || undefined,
+          chatPolicies: hasChatPolicies ? resolvedChatPolicies : prev.chatPolicies || undefined,
+          projectBindings: resolvedProjectBindings,
         },
       });
 
@@ -3193,8 +3554,10 @@ export function createMessengerSyncRouter({
             defaultReplyMode === 'always' || defaultReplyMode === 'mention'
               ? defaultReplyMode
               : prev.defaultReplyMode,
-          defaultUserId: defaultUserId || prev.defaultUserId,
+          defaultUserId: owners.defaultUserId,
+          ownerUserIds: owners.ownerUserIds,
           ...(hasAllowedChatIds ? { allowedChatIds: normalizeTelegramChatIds(allowedChatIds) } : {}),
+          ...(hasChatPolicies ? { chatPolicies: resolvedChatPolicies || {} } : {}),
         });
       }
 
@@ -3237,11 +3600,18 @@ export function createMessengerSyncRouter({
       if (telegram.listenerEnabled === false) {
         return res.json({ ok: false, reason: 'listener-disabled' });
       }
+      const owners = resolveTelegramOwnerFields(telegram, telegram);
       const result = telegramListener.start(telegram.botToken, {
         autoReply: telegram.autoReply !== false,
-        defaultUserId: telegram.defaultUserId,
+        defaultUserId: owners.defaultUserId,
+        ownerUserIds: owners.ownerUserIds,
         allowedChatIds: telegram.allowedChatIds,
         defaultReplyMode: telegram.defaultReplyMode,
+        chatPolicies:
+          telegram.chatPolicies && typeof telegram.chatPolicies === 'object'
+            ? telegram.chatPolicies
+            : {},
+        resolveProject: buildTelegramResolveProject(telegram.projectBindings),
       });
       res.json({ ok: true, ...result });
     } catch (err) {
