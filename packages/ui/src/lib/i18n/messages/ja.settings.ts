@@ -1,3 +1,6 @@
+import { discordIntegrationI18n } from './discord-integration.i18n';
+import { telegramIntegrationI18n } from './telegram-integration.i18n';
+import { thirdPartyIntegrationI18n } from './third-party-integrations.i18n';
 export const settingsDict = {
   'settings.providers.page.openCodeGo.title': 'OpenCode Go 使用量追跡',
   'settings.providers.page.openCodeGo.description': 'OpenCode Go ダッシュボードを接続して、ローリング、週間、月間のクォータを表示します。',
@@ -2129,4 +2132,9 @@ export const settingsDict = {
   'settings.openchamber.visual.field.followUpBehaviorDescription': 'エージェントが応答している間にフォローアップメッセージで Enter を押したときの動作を選択します。',
   'settings.openchamber.visual.option.followUpBehavior.steer.label': 'ステア',
   'settings.openchamber.visual.option.followUpBehavior.queue.label': 'キュー',
+  'settings.page.integrations.title': '連携',
+  'settings.openchamber.worktrees.list.openInDiscord': 'Discord で開く',
+  ...telegramIntegrationI18n.ja,
+  ...thirdPartyIntegrationI18n.ja,
+  ...discordIntegrationI18n.ja,
 } as const;

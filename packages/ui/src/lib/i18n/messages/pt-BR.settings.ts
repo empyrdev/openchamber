@@ -1,3 +1,6 @@
+import { discordIntegrationI18n } from './discord-integration.i18n';
+import { telegramIntegrationI18n } from './telegram-integration.i18n';
+import { thirdPartyIntegrationI18n } from './third-party-integrations.i18n';
 export const settingsDict = {
   'settings.providers.page.openCodeGo.title': 'Monitoramento de uso do OpenCode Go',
   'settings.providers.page.openCodeGo.description': 'Conecte o painel do OpenCode Go para exibir as cotas móvel, semanal e mensal.',
@@ -2129,4 +2132,9 @@ export const settingsDict = {
   "settings.openchamber.visual.field.followUpBehaviorDescription": "Choose what happens when you press Enter on a follow-up message while the agent is still responding.",
   "settings.openchamber.visual.option.followUpBehavior.steer.label": "Steer",
   "settings.openchamber.visual.option.followUpBehavior.queue.label": "Queue",
+  "settings.page.integrations.title": "Integrações",
+  "settings.openchamber.worktrees.list.openInDiscord": "Abrir no Discord",
+  ...telegramIntegrationI18n['pt-BR'],
+  ...thirdPartyIntegrationI18n['pt-BR'],
+  ...discordIntegrationI18n['pt-BR'],
 } as const;

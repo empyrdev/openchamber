@@ -1,3 +1,6 @@
+import { discordIntegrationI18n } from './discord-integration.i18n';
+import { telegramIntegrationI18n } from './telegram-integration.i18n';
+import { thirdPartyIntegrationI18n } from './third-party-integrations.i18n';
 export const settingsDict = {
   'settings.providers.page.openCodeGo.title': 'OpenCode Go 用量跟踪',
   'settings.providers.page.openCodeGo.description': '连接 OpenCode Go 控制面板以显示滚动、每周和每月配额。',
@@ -2129,4 +2132,9 @@ export const settingsDict = {
   'settings.openchamber.visual.field.followUpBehaviorDescription': 'Choose what happens when you press Enter on a follow-up message while the agent is still responding.',
   'settings.openchamber.visual.option.followUpBehavior.steer.label': 'Steer',
   'settings.openchamber.visual.option.followUpBehavior.queue.label': 'Queue',
+  'settings.page.integrations.title': '集成',
+  'settings.openchamber.worktrees.list.openInDiscord': '在 Discord 中打开',
+  ...telegramIntegrationI18n['zh-CN'],
+  ...thirdPartyIntegrationI18n['zh-CN'],
+  ...discordIntegrationI18n['zh-CN'],
 } as const;

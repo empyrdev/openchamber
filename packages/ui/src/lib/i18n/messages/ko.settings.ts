@@ -1,3 +1,6 @@
+import { discordIntegrationI18n } from './discord-integration.i18n';
+import { telegramIntegrationI18n } from './telegram-integration.i18n';
+import { thirdPartyIntegrationI18n } from './third-party-integrations.i18n';
 export const settingsDict = {
   'settings.providers.page.openCodeGo.title': 'OpenCode Go 사용량 추적',
   'settings.providers.page.openCodeGo.description': 'OpenCode Go 대시보드를 연결하여 롤링, 주간 및 월간 할당량을 표시합니다.',
@@ -2129,4 +2132,9 @@ export const settingsDict = {
   'settings.openchamber.visual.field.followUpBehaviorDescription': 'Choose what happens when you press Enter on a follow-up message while the agent is still responding.',
   'settings.openchamber.visual.option.followUpBehavior.steer.label': 'Steer',
   'settings.openchamber.visual.option.followUpBehavior.queue.label': 'Queue',
+  'settings.page.integrations.title': '통합',
+  'settings.openchamber.worktrees.list.openInDiscord': 'Discord에서 열기',
+  ...telegramIntegrationI18n.ko,
+  ...thirdPartyIntegrationI18n.ko,
+  ...discordIntegrationI18n.ko,
 } as const;

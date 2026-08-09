@@ -90,6 +90,11 @@ import { createNotificationTemplateRuntime } from './lib/notifications/template-
 import { createPermissionAutoAcceptRuntime } from './lib/permission-auto-accept/runtime.js';
 import { createGracefulShutdownRuntime } from './lib/opencode/shutdown-runtime.js';
 import { createProjectConfigRuntime } from './lib/projects/project-config.js';
+import { createMessengerSyncRouter } from './lib/messenger/messenger-sync.js';
+import {
+  createOpenChamberAgentEventsWebSocketRuntime,
+  broadcast as openChamberAgentEventsBroadcast,
+} from './lib/messenger/websocket.js';
 import { createRemoteClientAuthRuntime } from './lib/client-auth/remote-clients.js';
 import { createClientPairingRuntime } from './lib/client-auth/pairing.js';
 import { createPreviewProxyRuntime } from './lib/preview/proxy-runtime.js';
@@ -510,6 +515,7 @@ let runtimeManagedRemoteTunnelHostname = '';
 let terminalRuntime = null;
 let dictationRuntime = null;
 let messageStreamRuntime = null;
+let openChamberAgentEventsWebSocketRuntime = null;
 const userProvidedOpenCodePassword = hmrStateRuntime.getUserProvidedOpenCodePassword(hmrState);
 const initialOpenCodeAuthState = hmrStateRuntime.resolveOpenCodeAuthFromState({
   hmrState,
@@ -1254,6 +1260,10 @@ const gracefulShutdownRuntime = createGracefulShutdownRuntime({
   setMessageStreamRuntime: (value) => {
     messageStreamRuntime = value;
   },
+  getOpenChamberAgentEventsWebSocketRuntime: () => openChamberAgentEventsWebSocketRuntime,
+  setOpenChamberAgentEventsWebSocketRuntime: (value) => {
+    openChamberAgentEventsWebSocketRuntime = value;
+  },
   shouldSkipOpenCodeStop: () => ENV_SKIP_OPENCODE_START || isExternalOpenCode,
   getOpenCodePort: () => openCodePort,
   getOpenCodeProcess: () => openCodeProcess,
@@ -1687,6 +1697,47 @@ async function main(options = {}) {
     permissionAutoAcceptRuntime,
   });
 
+  // Discord + Telegram messenger bridge routes. The bridge plumbing lets each
+  // listener forward inbound messages to OpenCode and mirror streamed
+  // responses back into the originating channel/chat.
+  const { router: messengerRouter, discordListener, telegramListener } = createMessengerSyncRouter({
+    // Bridge approval button clicks to both the WS clients (UI) and
+    // the global event hub (so the bridge's initApprovalListener can
+    // respond to OpenCode).
+    broadcastEvent: (type, data) => {
+      try { openChamberAgentEventsBroadcast(type, data); } catch {}
+      try { globalMessageStreamHub?.publishEvent?.(type, data); } catch {}
+    },
+    globalEventHub: globalMessageStreamHub,
+    buildOpenCodeUrl,
+    getOpenCodeAuthHeaders,
+    listProjects: async () => {
+      const settings = await readSettingsFromDiskMigrated();
+      return sanitizeProjects(settings?.projects || []);
+    },
+    readSettings: readSettingsFromDiskMigrated,
+    persistSettings,
+    sanitizeProjects,
+    // Lets the bridge tell agents how to reach the scheduling API locally.
+    getLocalApiBaseUrl: () => `http://127.0.0.1:${tunnelRuntimeContext.getActivePort() || port}`,
+    // Discord /schedule writes into the SAME per-project scheduler the web
+    // UI's Scheduled-tasks dialog manages, so both stay in sync.
+    projectConfigRuntime,
+    scheduledTasksRuntime,
+    // Discord `/queue` (and the `. queue` suffix) write into the SAME
+    // server-owned message queue the web UI's queue chips manage, so both
+    // surfaces see and drain one queue.
+    startTunnelWithNormalizedRequest,
+    refreshOpenCodeAfterConfigChange,
+    // Mirroring (parts, permissions, questions, todos, title fallback) rides
+    // on the shared global event hub — start it when a listener starts so a
+    // headless server doesn't depend on a browser client connecting first.
+    ensureEventStream: () => ensureGlobalWatcherStarted(),
+  });
+  app.use('/api/messenger', messengerRouter);
+  app.use('/api/openchamber-agent/messenger', messengerRouter);
+  app.use('/api/otto/messenger', messengerRouter);
+
   const previewProxyRuntime = createPreviewProxyRuntime({
     crypto,
     URL,
@@ -1754,6 +1805,7 @@ async function main(options = {}) {
   terminalRuntime = startupPipelineResult.terminalRuntime;
   dictationRuntime = startupPipelineResult.dictationRuntime;
   messageStreamRuntime = startupPipelineResult.messageStreamRuntime;
+  openChamberAgentEventsWebSocketRuntime = startupPipelineResult.openChamberAgentEventsWebSocketRuntime;
 
   try {
     await scheduledTasksRuntime.start();

@@ -447,6 +447,7 @@ export const createSettingsHelpers = (dependencies) => {
       const trimmed = candidate.walkthroughModelOverride.trim();
       result.walkthroughModelOverride = trimmed.length > 0 ? trimmed : undefined;
     }
+
     if (typeof candidate.defaultGitIdentityId === 'string') {
       const trimmed = candidate.defaultGitIdentityId.trim();
       result.defaultGitIdentityId = trimmed.length > 0 ? trimmed : undefined;
@@ -516,6 +517,7 @@ export const createSettingsHelpers = (dependencies) => {
     }
     if (typeof candidate.showTurnChangedFiles === 'boolean') {
       result.showTurnChangedFiles = candidate.showTurnChangedFiles;
+    }
     }
     if (typeof candidate.showExpandedBashTools === 'boolean') {
       result.showExpandedBashTools = candidate.showExpandedBashTools;
@@ -858,8 +860,171 @@ export const createSettingsHelpers = (dependencies) => {
       }
     }
 
+    // Discord integration block (bot token + listener/bridge prefs).
+    // `null` clears the whole block (used by Disconnect).
+    if (candidate.discord === null) {
+      result.discord = null;
+    } else if (candidate.discord && typeof candidate.discord === 'object' && !Array.isArray(candidate.discord)) {
+      const sanitizedDiscord = sanitizeDiscordConfig(candidate.discord);
+      if (sanitizedDiscord) {
+        result.discord = sanitizedDiscord;
+      }
+    }
+
+    // Telegram integration block — same contract as discord (null clears).
+    if (candidate.telegram === null) {
+      result.telegram = null;
+    } else if (candidate.telegram && typeof candidate.telegram === 'object' && !Array.isArray(candidate.telegram)) {
+      const sanitizedTelegram = sanitizeTelegramConfig(candidate.telegram);
+      if (sanitizedTelegram) {
+        result.telegram = sanitizedTelegram;
+      }
+    }
+
     return result;
   };
+
+  const sanitizeDiscordConfig = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+    const result = {};
+    if (typeof value.botToken === 'string') {
+      const token = value.botToken.trim();
+      if (token.length > 0) {
+        result.botToken = token;
+      }
+    }
+    if (typeof value.guildId === 'string') {
+      const guildId = value.guildId.trim();
+      if (guildId.length > 0) {
+        result.guildId = guildId;
+      }
+    }
+    if (typeof value.defaultChannelId === 'string') {
+      const channelId = value.defaultChannelId.trim();
+      if (channelId.length > 0) {
+        result.defaultChannelId = channelId;
+      }
+    }
+    if (typeof value.defaultUserId === 'string') {
+      const userId = value.defaultUserId.trim();
+      if (userId.length > 0) {
+        result.defaultUserId = userId;
+      }
+    }
+    if (typeof value.autoReply === 'boolean') {
+      result.autoReply = value.autoReply;
+    }
+    if (typeof value.scopeToGuild === 'boolean') {
+      result.scopeToGuild = value.scopeToGuild;
+    }
+    if (value.defaultReplyMode === 'always' || value.defaultReplyMode === 'mention') {
+      result.defaultReplyMode = value.defaultReplyMode;
+    }
+    if (value.guildPolicies && typeof value.guildPolicies === 'object' && !Array.isArray(value.guildPolicies)) {
+      const guildPolicies = {};
+      for (const [guildId, entry] of Object.entries(value.guildPolicies)) {
+        if (typeof guildId !== 'string' || guildId.length === 0) {
+          continue;
+        }
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+          continue;
+        }
+        const policy = {};
+        if (typeof entry.enabled === 'boolean') {
+          policy.enabled = entry.enabled;
+        }
+        if (entry.replyMode === 'always' || entry.replyMode === 'mention' || entry.replyMode === 'inherit') {
+          policy.replyMode = entry.replyMode;
+        }
+        if (Object.keys(policy).length > 0) {
+          guildPolicies[guildId] = policy;
+        }
+      }
+      if (Object.keys(guildPolicies).length > 0) {
+        result.guildPolicies = guildPolicies;
+      }
+    }
+    // Global bridge mute removed — responding is per-server only.
+    // Coerce any legacy false to true so stale settings cannot mute replies.
+    if (Object.prototype.hasOwnProperty.call(value, 'bridgeEnabled')) {
+      result.bridgeEnabled = true;
+    }
+    // Absent means "start by default"; only an explicit false is sticky-stopped.
+    if (typeof value.listenerEnabled === 'boolean') {
+      result.listenerEnabled = value.listenerEnabled;
+    }
+    if (typeof value.registerDynamicSlashCommands === 'boolean') {
+      result.registerDynamicSlashCommands = value.registerDynamicSlashCommands;
+    }
+    if (Array.isArray(value.trustedBotIds)) {
+      result.trustedBotIds = value.trustedBotIds
+        .map((id) => (typeof id === 'string' ? id.trim() : String(id ?? '').trim()))
+        .filter((id) => id.length > 0);
+    }
+    if (Array.isArray(value.projectBindings)) {
+      result.projectBindings = value.projectBindings
+        .filter((binding) => binding && typeof binding === 'object' && binding.channelId && binding.projectPath)
+        .map((binding) => ({
+          channelId: String(binding.channelId),
+          projectPath: String(binding.projectPath),
+          ...(binding.projectLabel ? { projectLabel: String(binding.projectLabel) } : {}),
+        }));
+    }
+    return result;
+  };
+  const sanitizeTelegramConfig = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+    const result = {};
+    if (typeof value.botToken === 'string') {
+      const token = value.botToken.trim();
+      if (token.length > 0) {
+        result.botToken = token;
+      }
+    }
+    if (typeof value.defaultChatId === 'string') {
+      const chatId = value.defaultChatId.trim();
+      if (chatId.length > 0) {
+        result.defaultChatId = chatId;
+      }
+    }
+    if (typeof value.defaultUserId === 'string') {
+      const userId = value.defaultUserId.trim();
+      if (userId.length > 0) {
+        result.defaultUserId = userId;
+      }
+    }
+    if (typeof value.autoReply === 'boolean') {
+      result.autoReply = value.autoReply;
+    }
+    if (value.defaultReplyMode === 'always' || value.defaultReplyMode === 'mention') {
+      result.defaultReplyMode = value.defaultReplyMode;
+    }
+    if (Array.isArray(value.allowedChatIds)) {
+      result.allowedChatIds = Array.from(
+        new Set(
+          value.allowedChatIds
+            .map((id) => (typeof id === 'string' ? id.trim() : String(id ?? '').trim()))
+            .filter((id) => id.length > 0),
+        ),
+      );
+    }
+    // Global bridge mute is not a Telegram setting either — responding is
+    // governed by access control (owner / allowed chats). Coerce legacy false
+    // to true so stale settings cannot silently mute replies.
+    if (Object.prototype.hasOwnProperty.call(value, 'bridgeEnabled')) {
+      result.bridgeEnabled = true;
+    }
+    // Absent means "start by default"; only an explicit false is sticky-stopped.
+    if (typeof value.listenerEnabled === 'boolean') {
+      result.listenerEnabled = value.listenerEnabled;
+    }
+    return result;
+  };
+
 
   const mergePersistedSettings = (current, changes) => {
     const baseBookmarks = Array.isArray(changes.securityScopedBookmarks)
@@ -886,12 +1051,35 @@ export const createSettingsHelpers = (dependencies) => {
       typographySizes: nextTypographySizes
     };
 
+    // Explicit null clears Discord config from disk (Disconnect).
+    if (Object.prototype.hasOwnProperty.call(changes, 'discord') && changes.discord === null) {
+      delete next.discord;
+    }
+
+    // Explicit null clears Telegram config from disk (Disconnect).
+    if (Object.prototype.hasOwnProperty.call(changes, 'telegram') && changes.telegram === null) {
+      delete next.telegram;
+    }
+
     return next;
   };
 
   const formatSettingsResponse = (settings) => {
     const sanitized = sanitizeSettingsUpdate(settings);
     delete sanitized.managedRemoteTunnelToken;
+    // Never expose the Discord bot token through the generic settings API.
+    if (sanitized.discord && typeof sanitized.discord === 'object') {
+      const discord = { ...sanitized.discord };
+      delete discord.botToken;
+      sanitized.discord = discord;
+    }
+
+    // Never expose the Telegram bot token through the generic settings API.
+    if (sanitized.telegram && typeof sanitized.telegram === 'object') {
+      const telegram = { ...sanitized.telegram };
+      delete telegram.botToken;
+      sanitized.telegram = telegram;
+    }
     const bookmarks = normalizeStringArray(settings.securityScopedBookmarks);
     const hasManagedRemoteTunnelToken = typeof settings?.managedRemoteTunnelToken === 'string' && settings.managedRemoteTunnelToken.trim().length > 0;
     const pwaAppName = normalizePwaAppName(settings?.pwaAppName, '');
