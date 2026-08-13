@@ -108,4 +108,54 @@ describe("bootstrapDirectory", () => {
     expect(result).toBe("stale")
     expect(commits).toBe(0)
   })
+
+  test("does not re-apply a status snapshot when the status fetch failed", async () => {
+    let state = createState()
+    const statusCommits: unknown[] = []
+    const sdk = createSdk()
+    ;(sdk.session as { status: () => Promise<unknown> }).status = async () => {
+      throw new Error("status unavailable")
+    }
+    const result = await bootstrapDirectory({
+      directory: "/repo",
+      sdk,
+      getState: () => state,
+      set: (patch) => {
+        if (patch.session_status) statusCommits.push(patch.session_status)
+        state = { ...state, ...patch }
+      },
+      global: { config: {}, projects: [project] },
+      loadSessions: async () => undefined,
+    })
+
+    expect(result).toBe("complete")
+    // A failed session.status() must never clear existing global activity with
+    // an empty/initialized snapshot.
+    expect(statusCommits).toEqual([])
+  })
+
+  test("re-applies a successful status snapshot after the session list loads", async () => {
+    let state = createState()
+    const statusCommits: unknown[] = []
+    const sdk = createSdk()
+    ;(sdk.session as { status: () => Promise<unknown> }).status = async () => ({ data: { "child-1": { type: "busy" } } })
+    await bootstrapDirectory({
+      directory: "/repo",
+      sdk,
+      getState: () => state,
+      set: (patch) => {
+        if (patch.session_status) statusCommits.push(patch.session_status)
+        state = { ...state, ...patch }
+      },
+      global: { config: {}, projects: [project] },
+      loadSessions: async () => undefined,
+    })
+
+    // Phase 1 commits it once; the post-list re-application commits it again so
+    // the global status index can learn relations from the now-loaded records.
+    expect(statusCommits).toEqual([
+      { "child-1": { type: "busy" } },
+      { "child-1": { type: "busy" } },
+    ])
+  })
 })
