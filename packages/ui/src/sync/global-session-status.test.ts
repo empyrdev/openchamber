@@ -948,4 +948,34 @@ describe("derived parent activity from background children", () => {
     } as unknown as Event)
     expect(useGlobalSessionStatusStore.getState().statusById.has("parent-a")).toBe(false)
   })
+
+  test("uncomplicated status events with no tracked relations leave derived activity intact", () => {
+    learnRelation("child-a", "parent-a")
+    childStatus("child-a", "busy")
+    expect(useGlobalSessionStatusStore.getState().statusById.get("parent-a")?.status.type).toBe("busy")
+
+    // session-x has no parent and no children: its busy event cannot create or
+    // remove any derived entry, so recompute must not disturb parent-a.
+    childStatus("session-x", "busy")
+    expect(useGlobalSessionStatusStore.getState().statusById.get("parent-a")?.status.type).toBe("busy")
+    expect(useGlobalSessionStatusStore.getState().statusById.get("session-x")?.status.type).toBe("busy")
+
+    // The unrelated event must not swallow the real work either: settling
+    // child-a still clears the derived parent.
+    childStatus("child-a", "idle")
+    expect(useGlobalSessionStatusStore.getState().statusById.has("parent-a")).toBe(false)
+    expect(useGlobalSessionStatusStore.getState().statusById.get("session-x")?.status.type).toBe("busy")
+  })
+
+  test("an uncomplicated status event does not suppress later relation derivation", () => {
+    childStatus("session-x", "busy")
+    expect(useGlobalSessionStatusStore.getState().statusById.get("session-x")?.status.type).toBe("busy")
+
+    // The recompute fast path must not suppress relation work: a later busy
+    // child still derives its parent.
+    learnRelation("child-a", "parent-a")
+    childStatus("child-a", "busy")
+    expect(useGlobalSessionStatusStore.getState().statusById.get("parent-a")?.status.type).toBe("busy")
+    expect(useGlobalSessionStatusStore.getState().statusById.get("parent-a")?.derived).toBe(true)
+  })
 })

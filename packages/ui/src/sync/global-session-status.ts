@@ -197,6 +197,36 @@ const recomputeDerivedActivity = (
   }
   if (affected.size === 0) return state;
 
+  // Fast path: a recompute can only change the index by creating or removing a
+  // derived entry. An entry is created only when an affected session has a
+  // currently-active child, and removed only when an affected session currently
+  // holds one — derived entries never appear without such a raw/derived
+  // descendant (the fixpoint only propagates activity upward), so when neither
+  // holds (the common uncomplicated status event with no tracked relations),
+  // the scan below is provably a no-op. Skip the full statusById clone. The
+  // ancestor-skip of malformed back-edges is deliberately not mirrored here:
+  // such a child conservatively forces the full recompute, which skips it.
+  let canChangeDerived = false;
+  const statusById = state.statusById;
+  for (const sessionId of affected) {
+    if (statusById.get(sessionId)?.derived === true) {
+      canChangeDerived = true;
+      break;
+    }
+    const children = childrenByParent.get(sessionId);
+    if (children) {
+      for (const childId of children) {
+        const child = statusById.get(childId);
+        if (child && child.status.type !== 'idle') {
+          canChangeDerived = true;
+          break;
+        }
+      }
+    }
+    if (canChangeDerived) break;
+  }
+  if (!canChangeDerived) return state;
+
   // Precompute each affected session's ancestor set from the (stable) relation
   // maps. A child that is an ancestor of its own parent can only exist in a
   // malformed relation cycle; skipping such back-edges stops derived entries

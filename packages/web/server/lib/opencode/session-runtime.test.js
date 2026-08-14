@@ -1241,6 +1241,184 @@ describe('session runtime', () => {
       });
     });
 
+    it('does not reclaim a tombstone while the id is still referenced, so stale-event blocking survives cleanup cycles', () => {
+      vi.useFakeTimers();
+      const runtime = createSessionRuntime({
+        writeSseEvent() {},
+        getNotificationClients: () => new Set(),
+        broadcastEvent() {},
+      });
+
+      try {
+        // Busy child derives the parent, then the parent is terminal @150
+        // (tombstone baseline 150).
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', parentID: 'parent-1', time: { updated: 100 } } },
+        });
+        status(runtime, 'child-1', 'busy');
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'parent-1', time: { updated: 150, archived: 150 } } },
+        });
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toBeUndefined();
+
+        // A strictly newer child edge @201 restores the relation, so parent-1
+        // is referenced again (as a parent) and stays referenced through the
+        // cleanup cycle below.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', parentID: 'parent-1', time: { updated: 201 } } },
+        });
+        status(runtime, 'child-1', 'busy');
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toEqual({ type: 'busy' });
+
+        // Run a cleanup cycle well inside the 24h retention window.
+        vi.advanceTimersByTime(60 * 60 * 1000);
+
+        // The tombstone is still retained: the parent's own unversioned busy
+        // status remains blocked (no raw state, no operational count change),
+        // exactly as before cleanup ran.
+        status(runtime, 'parent-1', 'busy');
+        expect(runtime.getSessionStateSnapshot()['parent-1']).toBeUndefined();
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toEqual({ type: 'busy' });
+        expect(runtime.getActiveSessionCount()).toBe(1);
+      } finally {
+        runtime.dispose();
+        vi.useRealTimers();
+      }
+    });
+
+    it('reclaims a tombstone once the id is unreferenced and the retention window passes, forgetting the id', () => {
+      vi.useFakeTimers();
+      const runtime = createSessionRuntime({
+        writeSseEvent() {},
+        getNotificationClients: () => new Set(),
+        broadcastEvent() {},
+      });
+
+      try {
+        // Archive the parent @150: terminal, so no relation, raw state, or
+        // activity remains for it — only the tombstone.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'parent-1', time: { updated: 150, archived: 150 } } },
+        });
+        expect(runtime.getSessionActivitySnapshot()).toEqual({});
+        expect(runtime.getSessionStateSnapshot()).toEqual({});
+
+        // Inside the retention window a stale reconnection stays blocked: the
+        // old-recency child edge cannot re-create the archived parent.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', parentID: 'parent-1', time: { updated: 100 } } },
+        });
+        status(runtime, 'child-1', 'busy');
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toBeUndefined();
+
+        // Cross the deliberate retention window (the hourly cleanup fires
+        // along the way): the unreferenced id's tombstone is reclaimed.
+        vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+
+        // The id is now forgotten like any id pruned by the state TTL: an
+        // unversioned busy status creates raw state and counts operationally,
+        // exactly as for a brand-new session id.
+        status(runtime, 'parent-1', 'busy');
+        expect(runtime.getSessionStateSnapshot()['parent-1'].status).toBe('busy');
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toEqual({ type: 'busy' });
+        expect(runtime.getActiveSessionCount()).toBe(1);
+      } finally {
+        runtime.dispose();
+        vi.useRealTimers();
+      }
+    });
+
+    it('reclaims relation recency only after the 24h retention expiry so an older record is treated as a fresh session', () => {
+      vi.useFakeTimers();
+      const runtime = createSessionRuntime({
+        writeSseEvent() {},
+        getNotificationClients: () => new Set(),
+        broadcastEvent() {},
+      });
+
+      try {
+        // Complete child record @200 plus a busy status establish the recency
+        // baseline and the parent-child relation.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', parentID: 'parent-1', time: { updated: 200 } } },
+        });
+        status(runtime, 'child-1', 'busy');
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toEqual({ type: 'busy' });
+        expect(runtime.getActiveSessionCount()).toBe(1);
+
+        // Let everything about the session age past the 24h TTLs: raw state,
+        // activity phase, and the parent-child relation are all pruned by the
+        // hourly cleanup. The recency baseline is retained for the deliberate
+        // 24h stale-event window, so it is reclaimed only after this same
+        // window passes.
+        vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+        expect(runtime.getSessionStateSnapshot()['child-1']).toBeUndefined();
+        expect(runtime.getSessionActivitySnapshot()).toEqual({});
+
+        // The retention window has expired: the id is forgotten like any id
+        // pruned by the state TTL, so a delayed older record @100 is no longer
+        // rejected as stale and is admitted as a fresh session, deriving the
+        // parent again.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', parentID: 'parent-1', time: { updated: 100 } } },
+        });
+        status(runtime, 'child-1', 'busy');
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toEqual({ type: 'busy' });
+        expect(runtime.getActiveSessionCount()).toBe(1);
+      } finally {
+        runtime.dispose();
+        vi.useRealTimers();
+      }
+    });
+
+    it('retains a root/detach ordering baseline through hourly cleanup before 24h so a delayed older reparent record stays rejected', () => {
+      vi.useFakeTimers();
+      const runtime = createSessionRuntime({
+        writeSseEvent() {},
+        getNotificationClients: () => new Set(),
+        broadcastEvent() {},
+      });
+
+      try {
+        // A newer root record (omitted parentID) establishes the child's
+        // ordering baseline at @200 with no active raw state: the child never
+        // went busy, so nothing else references the id.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', time: { updated: 200 } } },
+        });
+        expect(runtime.getSessionActivitySnapshot()).toEqual({});
+        expect(runtime.getActiveSessionCount()).toBe(0);
+
+        // Hourly cleanup fires well inside the 24h stale-event window. The
+        // unreferenced recency baseline must survive (like a tombstone), or a
+        // delayed older child relation event could slip past as fresh.
+        vi.advanceTimersByTime(23 * 60 * 60 * 1000);
+
+        // A delayed older reparent record @100 must not re-adopt the child to
+        // the stale ancestor: the root ordering baseline outlived every
+        // cleanup cycle inside the window.
+        runtime.processOpenCodeSsePayload({
+          type: 'session.updated',
+          properties: { info: { id: 'child-1', parentID: 'parent-1', time: { updated: 100 } } },
+        });
+        status(runtime, 'child-1', 'busy');
+        expect(runtime.getSessionActivitySnapshot()['parent-1']).toBeUndefined();
+        expect(runtime.getSessionActivitySnapshot()['child-1']).toEqual({ type: 'busy' });
+        expect(runtime.getActiveSessionCount()).toBe(1);
+      } finally {
+        runtime.dispose();
+        vi.useRealTimers();
+      }
+    });
+
     it('normalizes session.idle and session.error terminal events to idle for lifecycle settlement', () => {
       const runtime = createSessionRuntime({
         writeSseEvent() {},

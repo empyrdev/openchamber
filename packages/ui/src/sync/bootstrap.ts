@@ -319,8 +319,18 @@ export async function bootstrapDirectory(input: {
   // poll/event. Only a fetch that actually succeeded re-applies — a failed
   // `session.status()` must never clear existing global activity with an
   // empty/initialized snapshot.
+  //
+  // Re-apply the store's CURRENT status view, not the phase-1 capture: live
+  // `session.status`/`session.idle`/`session.error` events that arrived while
+  // the session list loaded updated the same store, so committing the older
+  // capture verbatim would clobber that newer live state. The store already
+  // holds the capture overlaid with every live mutation (status events are the
+  // only writers to `session_status`), so committing the current view keeps
+  // those updates; when nothing diverged it is the identical reference, and the
+  // re-apply stays a no-op for store subscribers while still re-running the
+  // global snapshot reconciliation with the now-complete session list.
   if (committedStatuses) {
-    commit({ session_status: committedStatuses })
+    commit({ session_status: getState().session_status })
   }
   return "complete"
 }

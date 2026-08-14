@@ -3,6 +3,12 @@ const SESSION_STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SESSION_ATTENTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SESSION_ACTIVITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SESSION_STATE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+// Deliberate retention window for stale-event ordering metadata: deletion/
+// archive tombstones and relation-recency baselines are both kept while stale
+// events for their session id could still be in flight, then the hourly
+// cleanup forgets the id entirely once it is unreferenced and this window has
+// passed (the same 24h horizon used for every other runtime-owned map).
+const SESSION_TOMBSTONE_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const extractSessionStatusUpdate = (payload) => {
   if (!payload) {
@@ -148,16 +154,27 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
   // Recency of the last applied complete session record per child session, so
   // a delayed older record cannot overwrite a newer reparent/detach relation
   // or re-adopt a busy child to a stale ancestor (mirrors the UI relation
-  // index). Cleared with the relation maps on deletion/reset/dispose.
+  // index). Each entry stores the accepted record recency plus the wall-clock
+  // time it was established, and the hourly cleanup retains an unreferenced
+  // entry for the same deliberate retention window as tombstones
+  // (SESSION_TOMBSTONE_RETENTION_MS): a root/detach ordering baseline must
+  // survive cleanup even when the session has no active raw state, or a
+  // delayed older child relation event could be admitted as fresh and
+  // reparent the session before the window expires. Cleared with the relation
+  // maps on deletion/reset/dispose.
   const relationRecencyBySession = new Map();
   // Deletion tombstones keyed by the deleted session id with the deletion-time
   // recency baseline (the newest record recency related to that session: the
   // deletion event's record time where available, the session's own last
-  // applied record, and any child-side records referencing it). A record that
-  // is not strictly newer than the baseline cannot reconnect the deleted id as
-  // a child or parent — even when the proposing child has no prior relation
-  // recency — while an authoritative strictly-newer record admits re-creation.
-  // Cleared on reset/dispose.
+  // applied record, and any child-side records referencing it) plus the
+  // wall-clock creation time. A record that is not strictly newer than the
+  // baseline cannot reconnect the deleted id as a child or parent — even when
+  // the proposing child has no prior relation recency — while an
+  // authoritative strictly-newer record admits re-creation. The hourly cleanup
+  // reclaims a tombstone only once its id is no longer referenced anywhere and
+  // the deliberate retention window (SESSION_TOMBSTONE_RETENTION_MS) has
+  // passed, so stale session ids cannot grow permanently while stale-event
+  // rejection stays correct inside the window. Cleared on reset/dispose.
   const relationTombstones = new Map();
 
   const learnChildRelation = (childId, parentId) => {
@@ -310,13 +327,13 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
   // (where the baseline comparison still applies).
   const isStaleTerminalRecord = (sessionId, info) => {
     const terminalRecency = getRecordRecency(info);
-    const tombstoneBaseline = relationTombstones.get(sessionId);
+    const tombstoneBaseline = relationTombstones.get(sessionId)?.baseline;
     if (tombstoneBaseline !== undefined && terminalRecency <= tombstoneBaseline) return true;
     if (terminalRecency === 0) return false;
-    let newestAccepted = relationRecencyBySession.get(sessionId) ?? 0;
+    let newestAccepted = relationRecencyBySession.get(sessionId)?.recency ?? 0;
     for (const [childId, parentId] of childParents.entries()) {
       if (parentId === sessionId) {
-        newestAccepted = Math.max(newestAccepted, relationRecencyBySession.get(childId) ?? 0);
+        newestAccepted = Math.max(newestAccepted, relationRecencyBySession.get(childId)?.recency ?? 0);
       }
     }
     return newestAccepted > 0 && terminalRecency <= newestAccepted;
@@ -333,13 +350,19 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
     // recency related to the session): only a strictly-newer authoritative
     // record may reconnect it as a parent or child later.
     let tombstoneBaseline = deletionInfo ? getRecordRecency(deletionInfo) : 0;
-    tombstoneBaseline = Math.max(tombstoneBaseline, relationRecencyBySession.get(sessionId) ?? 0);
+    tombstoneBaseline = Math.max(tombstoneBaseline, relationRecencyBySession.get(sessionId)?.recency ?? 0);
     for (const [childId, parentId] of childParents.entries()) {
       if (parentId === sessionId) {
-        tombstoneBaseline = Math.max(tombstoneBaseline, relationRecencyBySession.get(childId) ?? 0);
+        tombstoneBaseline = Math.max(tombstoneBaseline, relationRecencyBySession.get(childId)?.recency ?? 0);
       }
     }
-    relationTombstones.set(sessionId, Math.max(relationTombstones.get(sessionId) ?? 0, tombstoneBaseline));
+    relationTombstones.set(sessionId, {
+      // A fresh strictly-newer terminal restarts the deliberate retention
+      // window so an id that was re-created and then deleted again stays
+      // protected for the full window.
+      baseline: Math.max(relationTombstones.get(sessionId)?.baseline ?? 0, tombstoneBaseline),
+      createdAt: Date.now(),
+    });
     // As a parent: orphan outbound children FIRST so the deleted session can
     // no longer be treated as active (its own descendants must not keep it or
     // its former parent derived-active). Their own liveness continues, but
@@ -678,6 +701,39 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
         forgetChildRelation(childId);
       }
     }
+    // Bound the relation metadata lifecycle: after the state/phase/relation
+    // pruning above, reclaim recency baselines and deletion tombstones for
+    // session ids the runtime no longer references, so forgotten session ids
+    // cannot grow permanently. A recency entry is meaningful while the id
+    // still participates in a retained relation/state/phase or is still gated
+    // by a tombstone, and an unreferenced entry is retained for the same
+    // deliberate stale-event window as a tombstone (SESSION_TOMBSTONE_
+    // RETENTION_MS): a root/detach ordering baseline with no active raw state
+    // must keep rejecting delayed older child relation records instead of
+    // being pruned by the very first hourly cleanup. A tombstone is reclaimed
+    // only once the id is fully unreferenced AND its deliberate retention
+    // window has passed — inside the window a stale reconnection stays
+    // blocked (no reanimation of a deleted/archived session), and after the
+    // window the id is forgotten like any id pruned by the state TTL, so a
+    // later record is a fresh session.
+    const referencedSessionIds = new Set();
+    for (const [childId, parentId] of childParents) {
+      referencedSessionIds.add(childId);
+      referencedSessionIds.add(parentId);
+    }
+    for (const [sessionId] of sessionStates) referencedSessionIds.add(sessionId);
+    for (const [sessionId] of sessionAttentionStates) referencedSessionIds.add(sessionId);
+    for (const [sessionId] of sessionActivityPhases) referencedSessionIds.add(sessionId);
+    for (const [sessionId, tombstone] of relationTombstones) {
+      if (referencedSessionIds.has(sessionId)) continue;
+      if (now - tombstone.createdAt <= SESSION_TOMBSTONE_RETENTION_MS) continue;
+      relationTombstones.delete(sessionId);
+    }
+    for (const [sessionId, recencyEntry] of relationRecencyBySession) {
+      if (referencedSessionIds.has(sessionId) || relationTombstones.has(sessionId)) continue;
+      if (now - recencyEntry.createdAt <= SESSION_TOMBSTONE_RETENTION_MS) continue;
+      relationRecencyBySession.delete(sessionId);
+    }
   };
 
   const cleanupInterval = setInterval(cleanupOldSessionStates, SESSION_STATE_CLEANUP_INTERVAL_MS);
@@ -700,7 +756,7 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
       // terminal staleness gate inside handleSessionDeleted also rejects a
       // delayed archive that is not strictly newer than the deletion tombstone
       // baseline or the newest accepted relation/session recency.
-      const tracked = relationRecencyBySession.get(archived.sessionId);
+      const tracked = relationRecencyBySession.get(archived.sessionId)?.recency;
       if (tracked === undefined || getRecordRecency(archived.info) >= tracked) {
         handleSessionDeleted(archived.sessionId, archived.info);
       }
@@ -712,13 +768,13 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
       // A stale complete session record (older than the last applied one) must
       // not overwrite a newer reparent/detach relation or re-adopt a busy
       // child to a stale ancestor: skip it entirely (no mutation, no adoption).
-      const tracked = relationRecencyBySession.get(relation.childId);
+      const tracked = relationRecencyBySession.get(relation.childId)?.recency;
       if (tracked !== undefined && relation.recency < tracked) return;
       // A delayed same-recency record must not reconnect this session (or a
       // busy child) to a deleted session id; only a record strictly newer than
       // the deletion-time tombstone baseline may re-create the relation.
-      const childTombstone = relationTombstones.get(relation.childId);
-      const parentTombstone = typeof relation.parentId === 'string' ? relationTombstones.get(relation.parentId) : undefined;
+      const childTombstone = relationTombstones.get(relation.childId)?.baseline;
+      const parentTombstone = typeof relation.parentId === 'string' ? relationTombstones.get(relation.parentId)?.baseline : undefined;
       if (childTombstone !== undefined || parentTombstone !== undefined) {
         const tombstoneBaseline = Math.max(childTombstone ?? 0, parentTombstone ?? 0);
         if (relation.recency <= tombstoneBaseline) return;
@@ -729,7 +785,14 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
         // parent itself has a strictly-newer complete record (which moves the
         // parent's relation recency above the baseline).
       }
-      relationRecencyBySession.set(relation.childId, relation.recency);
+      relationRecencyBySession.set(relation.childId, {
+        recency: relation.recency,
+        // Each accepted record restarts the deliberate retention window for
+        // this baseline (matching how a fresh terminal restarts a tombstone),
+        // so protection always covers the most recently accepted ordering
+        // point instead of expiring from an older write.
+        createdAt: Date.now(),
+      });
       learnChildRelation(relation.childId, relation.parentId);
       // A busy status may have arrived before the child record: adopt the
       // already-running child so the parent surfaces active immediately.
@@ -747,8 +810,8 @@ export const createSessionRuntime = ({ writeSseEvent, getNotificationClients, br
     // complete record moves the session's relation recency above the deletion
     // baseline, so a delayed busy status cannot resurrect a deleted/archived
     // session's raw state, phase, or operational count.
-    const statusTombstoneBaseline = relationTombstones.get(update.sessionId);
-    if (statusTombstoneBaseline !== undefined && (relationRecencyBySession.get(update.sessionId) ?? 0) <= statusTombstoneBaseline) return;
+    const statusTombstoneBaseline = relationTombstones.get(update.sessionId)?.baseline;
+    if (statusTombstoneBaseline !== undefined && (relationRecencyBySession.get(update.sessionId)?.recency ?? 0) <= statusTombstoneBaseline) return;
 
     const parentId = childParents.get(update.sessionId);
     if (parentId) {
