@@ -13,7 +13,7 @@ import {
   resetGlobalSessionStatus,
   useGlobalSessionStatusStore,
 } from '../global-session-status.ts'
-import { deriveRecentSessions } from '../../components/session/sidebar/activitySections.ts'
+import { deriveRecentSessions } from '../../components/session/sidebar/recent/activitySections.ts'
 
 // Mirrors the production 48h window in activitySections.ts (the constant is
 // not exported).

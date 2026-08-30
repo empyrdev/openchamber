@@ -3,15 +3,16 @@ import { create } from 'zustand';
 import type { Event, SessionStatus } from '@opencode-ai/sdk/v2/client';
 import { normalizeProjectPath } from '@/lib/projectResolution';
 import {
-  observeSessionActivityEvent,
+  applySessionOrderingMutations,
   reconcileSessionActivitySnapshot,
-  removeSessionOrdering,
+  type SessionOrderingMutation,
 } from './session-ordering';
 import {
-  observeSessionActivityTiming,
+  applySessionActivityTimingMutations,
   reconcileSessionActivityTiming,
-  removeSessionActivityTiming,
+  type SessionActivityTimingMutation,
 } from './session-activity-timing';
+import { countSyncPerformance } from './performance-diagnostics';
 
 // Shared live busy/retry index for every directory. Global events update it
 // incrementally and authoritative directory snapshots reconcile it, so each
@@ -38,11 +39,33 @@ type GlobalSessionStatusEntry = {
 
 type GlobalSessionStatusState = {
   statusById: Map<string, GlobalSessionStatusEntry>;
+  activeSessionIds: ReadonlySet<string>;
 };
 
-export const useGlobalSessionStatusStore = create<GlobalSessionStatusState>(() => ({
+const EMPTY_ACTIVE_SESSION_IDS: ReadonlySet<string> = new Set();
+
+const initialState: GlobalSessionStatusState = {
   statusById: new Map(),
-}));
+  activeSessionIds: EMPTY_ACTIVE_SESSION_IDS,
+};
+
+export const useGlobalSessionStatusStore = create<GlobalSessionStatusState>(() => initialState);
+useGlobalSessionStatusStore.subscribe(() => countSyncPerformance('globalStatusPublications'));
+
+/** Replace the status index while deriving its active membership atomically. */
+export const replaceGlobalSessionStatusById = (statusById: Map<string, GlobalSessionStatusEntry>): void => {
+  const current = useGlobalSessionStatusStore.getState();
+  const activeSessionIds = new Set<string>();
+  for (const [sessionId, entry] of statusById) {
+    if (entry.status.type === 'busy' || entry.status.type === 'retry') activeSessionIds.add(sessionId);
+  }
+  const sameMembership = activeSessionIds.size === current.activeSessionIds.size
+    && [...activeSessionIds].every((sessionId) => current.activeSessionIds.has(sessionId));
+  useGlobalSessionStatusStore.setState({
+    statusById,
+    activeSessionIds: sameMembership ? current.activeSessionIds : activeSessionIds,
+  });
+};
 
 // Authoritative parent-child relations learned from session records
 // (`session.updated` / `session.created` carry `info.parentID`, and the
@@ -285,7 +308,7 @@ const recomputeDerivedActivity = (
     if (!passChanged) break;
     changed = true;
   }
-  return changed ? { statusById: next } : state;
+  return changed ? withActiveSessionIds(state, next) : state;
 };
 
 /** Read-only derived status for a session that only exists while a background
@@ -306,7 +329,7 @@ export const resetGlobalSessionStatus = (): void => {
   relationDirectoryByChild.clear();
   relationRecencyBySession.clear();
   relationTombstones.clear();
-  useGlobalSessionStatusStore.setState({ statusById: new Map() });
+  useGlobalSessionStatusStore.setState({ statusById: new Map(), activeSessionIds: EMPTY_ACTIVE_SESSION_IDS });
 };
 
 const normalizeStatusType = (type: unknown): ActiveStatusType | 'idle' => {
@@ -319,20 +342,58 @@ const statusesEqual = (left: SessionStatus, right: SessionStatus): boolean => (
   left.type === right.type && JSON.stringify(left) === JSON.stringify(right)
 );
 
+const withActiveSessionIds = (
+  state: GlobalSessionStatusState,
+  statusById: Map<string, GlobalSessionStatusEntry>,
+): GlobalSessionStatusState => {
+  const activeSessionIds = new Set<string>();
+  for (const [sessionId, entry] of statusById) {
+    if (entry.status.type === 'busy' || entry.status.type === 'retry') activeSessionIds.add(sessionId);
+  }
+  const sameMembership = activeSessionIds.size === state.activeSessionIds.size
+    && [...activeSessionIds].every((sessionId) => state.activeSessionIds.has(sessionId));
+  return {
+    statusById,
+    activeSessionIds: sameMembership ? state.activeSessionIds : activeSessionIds,
+  };
+};
+
 // Both write paths normalize the directory key, so a polled snapshot can
 // authoritatively replace entries written by events (and vice versa) even when
 // the two sources format the same path differently (trailing slash, …).
 const normalizeDirectory = (directory: string): string =>
   normalizeProjectPath(directory) ?? directory;
 
+let statusBatchState: GlobalSessionStatusState | null = null;
+let orderingBatchMutations: SessionOrderingMutation[] | null = null;
+let timingBatchMutations: SessionActivityTimingMutation[] | null = null;
+
+const updateStatusState = (update: (state: GlobalSessionStatusState) => GlobalSessionStatusState): void => {
+  if (statusBatchState) {
+    statusBatchState = update(statusBatchState);
+    return;
+  }
+  useGlobalSessionStatusStore.setState(update);
+};
+
+const queueOrderingMutation = (mutation: SessionOrderingMutation): void => {
+  if (orderingBatchMutations) orderingBatchMutations.push(mutation);
+  else applySessionOrderingMutations([mutation]);
+};
+
+const queueTimingMutation = (mutation: SessionActivityTimingMutation): void => {
+  if (timingBatchMutations) timingBatchMutations.push(mutation);
+  else applySessionActivityTimingMutations([mutation]);
+};
+
 const setStatus = (sessionId: string, directory: string, status: SessionStatus | { type: 'idle' }): void => {
-  useGlobalSessionStatusStore.setState((state) => {
+  updateStatusState((state) => {
     const current = state.statusById.get(sessionId);
     if (status.type === 'idle') {
       if (!current) return state;
       const next = new Map(state.statusById);
       next.delete(sessionId);
-      return { statusById: next };
+      return withActiveSessionIds(state, next);
     }
     // An authoritative raw busy/retry always replaces a matching synthetic
     // entry (derived:true), so child settlement cannot later delete a parent
@@ -341,7 +402,7 @@ const setStatus = (sessionId: string, directory: string, status: SessionStatus |
     if (current && !current.derived && current.directory === directory && statusesEqual(current.status, status)) return state;
     const next = new Map(state.statusById);
     next.set(sessionId, { status, directory });
-    return { statusById: next };
+    return withActiveSessionIds(state, next);
   });
 };
 
@@ -383,8 +444,8 @@ const handleTerminalDeletion = (
   // that a newer child edge restored: only a strictly-newer terminal record
   // terminates it, preserving the restored relation and derived activity.
   if (isStaleTerminalRecord(sessionId, baselineSource)) return;
-  removeSessionOrdering(sessionId);
-  removeSessionActivityTiming(sessionId);
+  queueOrderingMutation({ type: 'remove', sessionId });
+  queueTimingMutation({ type: 'remove', sessionId });
   setStatus(sessionId, normalizeDirectory(directory), { type: 'idle' });
   let tombstoneBaseline = baselineSource ? getSessionRecencyTimestamp(baselineSource) : 0;
   tombstoneBaseline = Math.max(tombstoneBaseline, relationRecencyBySession.get(sessionId) ?? 0);
@@ -408,7 +469,7 @@ const handleTerminalDeletion = (
   // Recompute the deleted session (drops its own derived entry), its former
   // parent (drops its derived entry), and the orphaned children (their
   // ancestors changed), before the relation is unreachable.
-  useGlobalSessionStatusStore.setState((state) => recomputeDerivedActivity(state, [sessionId, formerParentId ?? '', ...orphanedChildIds]));
+  updateStatusState((state) => recomputeDerivedActivity(state, [sessionId, formerParentId ?? '', ...orphanedChildIds]));
 };
 
 // Unversioned `session.status` / `session.idle` / `session.error` updates carry
@@ -474,7 +535,7 @@ export const applyGlobalSessionStatusEvent = (directory: string, payload: Event)
       } else {
         relationDirectoryByChild.delete(sessionId);
       }
-      useGlobalSessionStatusStore.setState((state) => recomputeDerivedActivity(state, [sessionId, sessionInfo.parentID ?? '', formerParentId ?? '']));
+      updateStatusState((state) => recomputeDerivedActivity(state, [sessionId, sessionInfo.parentID ?? '', formerParentId ?? '']));
       return;
     }
     case 'session.status': {
@@ -488,10 +549,10 @@ export const applyGlobalSessionStatusEvent = (directory: string, payload: Event)
         normalizeDirectory(directory),
         type === 'idle' ? { type: 'idle' } : { ...(props.status ?? {}), type } as SessionStatus,
       );
-      observeSessionActivityEvent(sessionId, type === 'idle' ? 'settled' : 'active');
+      queueOrderingMutation({ type: 'observe', sessionId, phase: type === 'idle' ? 'settled' : 'active' });
       // `retry` is still a running turn, so the elapsed counter keeps going.
-      observeSessionActivityTiming(sessionId, type === 'idle' ? 'settled' : 'active');
-      useGlobalSessionStatusStore.setState((state) => recomputeDerivedActivity(state, [sessionId, parentIdByChild.get(sessionId) ?? '']));
+      queueTimingMutation({ type: 'observe', sessionId, phase: type === 'idle' ? 'settled' : 'active' });
+      updateStatusState((state) => recomputeDerivedActivity(state, [sessionId, parentIdByChild.get(sessionId) ?? '']));
       return;
     }
     case 'session.idle':
@@ -500,23 +561,42 @@ export const applyGlobalSessionStatusEvent = (directory: string, payload: Event)
       const sessionId = typeof props?.sessionID === 'string' ? props.sessionID : '';
       if (sessionId && !isStatusBlockedByTombstone(sessionId)) {
         setStatus(sessionId, normalizeDirectory(directory), { type: 'idle' });
-        observeSessionActivityEvent(sessionId, 'settled');
-        observeSessionActivityTiming(sessionId, 'settled');
-        useGlobalSessionStatusStore.setState((state) => recomputeDerivedActivity(state, [sessionId, parentIdByChild.get(sessionId) ?? '']));
+        queueOrderingMutation({ type: 'observe', sessionId, phase: 'settled' });
+        queueTimingMutation({ type: 'observe', sessionId, phase: 'settled' });
+        updateStatusState((state) => recomputeDerivedActivity(state, [sessionId, parentIdByChild.get(sessionId) ?? '']));
       }
       return;
     }
     case 'session.deleted': {
       const props = payload.properties as { sessionID?: string; info?: { id?: string; time?: { updated?: number; created?: number } } } | undefined;
       const sessionId = props?.sessionID ?? props?.info?.id;
-      if (sessionId) {
-        handleTerminalDeletion(sessionId, directory, props?.info);
-      }
+      if (sessionId) handleTerminalDeletion(sessionId, directory, props?.info);
       return;
     }
     default:
       return;
   }
+};
+
+// Keep the ordered batch entrypoint used by the event pipeline. Relation
+// updates are delegated through the same reducer so lifecycle/tombstone rules
+// remain identical for both paths.
+export const applyGlobalSessionStatusEvents = (directory: string, payloads: readonly Event[]): void => {
+  if (payloads.length === 0) return;
+  const initialState = useGlobalSessionStatusStore.getState();
+  statusBatchState = initialState;
+  orderingBatchMutations = [];
+  timingBatchMutations = [];
+  for (const payload of payloads) applyGlobalSessionStatusEvent(directory, payload);
+  const nextState = statusBatchState;
+  const orderingMutations = orderingBatchMutations;
+  const timingMutations = timingBatchMutations;
+  statusBatchState = null;
+  orderingBatchMutations = null;
+  timingBatchMutations = null;
+  if (nextState && nextState !== initialState) useGlobalSessionStatusStore.setState(nextState);
+  if (orderingMutations) applySessionOrderingMutations(orderingMutations);
+  if (timingMutations) applySessionActivityTimingMutations(timingMutations);
 };
 
 // Polled path: an authoritative `/session/status?directory=X` snapshot. Entries
@@ -628,10 +708,25 @@ export const applyGlobalSessionStatusSnapshot = (
   useGlobalSessionStatusStore.setState((state) => {
     let changed = false;
     const next = new Map(state.statusById);
+    let nextActiveSessionIds: Set<string> | null = null;
+    const hasActiveSession = (sessionId: string): boolean => (
+      (nextActiveSessionIds ?? state.activeSessionIds).has(sessionId)
+    );
+    const removeActiveSession = (sessionId: string): void => {
+      if (!hasActiveSession(sessionId)) return;
+      nextActiveSessionIds ??= new Set(state.activeSessionIds);
+      nextActiveSessionIds.delete(sessionId);
+    };
+    const addActiveSession = (sessionId: string): void => {
+      if (hasActiveSession(sessionId)) return;
+      nextActiveSessionIds ??= new Set(state.activeSessionIds);
+      nextActiveSessionIds.add(sessionId);
+    };
 
     for (const [sessionId, entry] of state.statusById) {
       if ((entry.directory === directory || known.has(sessionId)) && !(sessionId in raw)) {
         next.delete(sessionId);
+        removeActiveSession(sessionId);
         changed = true;
       }
     }
@@ -642,6 +737,7 @@ export const applyGlobalSessionStatusSnapshot = (
       if (type === 'idle') {
         if (current && (current.directory === directory || known.has(sessionId))) {
           next.delete(sessionId);
+          removeActiveSession(sessionId);
           changed = true;
         }
         continue;
@@ -649,21 +745,26 @@ export const applyGlobalSessionStatusSnapshot = (
       // A status snapshot cannot re-enable a tombstoned id absent a
       // strictly-newer complete record for that same id.
       if (isStatusBlockedByTombstone(sessionId)) continue;
+      // SAFETY: normalizeStatusType has narrowed this snapshot entry to the SDK's busy/retry status discriminator.
       const normalizedStatus = { ...status, type } as SessionStatus;
       // A snapshot is authoritative raw state: it always replaces a synthetic
       // entry (even with a matching type), so a raw-active parent written by
       // the snapshot survives later child settlement.
       if (!current || current.directory !== directory || current.derived === true || !statusesEqual(current.status, normalizedStatus)) {
         next.set(sessionId, { status: normalizedStatus, directory });
+        if (!current) addActiveSession(sessionId);
         changed = true;
       }
     }
 
-    const rawState = changed ? { statusById: next } : state;
+    const rawState = changed ? withActiveSessionIds(state, next) : state;
     // Re-derive parents after clearing: a parent omitted by the snapshot (idle)
     // is re-added as derived busy exactly when one of its children is active in
     // this snapshot, so an authoritative resync never overwrites child-derived
     // parent activity with a false idle.
-    return recomputeDerivedActivity(rawState, affectedSessionIds);
+    return recomputeDerivedActivity(
+      rawState,
+      affectedSessionIds,
+    );
   });
 };

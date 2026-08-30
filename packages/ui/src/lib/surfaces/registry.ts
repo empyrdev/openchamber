@@ -6,6 +6,7 @@ export type ContextSurfaceId =
   | 'editor'
   | 'git'
   | 'pr'
+  | 'linear'
   | 'diff'
   | 'walkthrough'
   | 'terminal'
@@ -66,6 +67,15 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
     availability: 'always',
   },
   {
+    id: 'linear',
+    descriptionKey: 'contextRail.surface.linear.description',
+    defaultWidthFraction: 0.45,
+    mode: 'linear',
+    icon: 'linear',
+    labelKey: 'contextPanel.mode.linear',
+    availability: 'always',
+  },
+  {
     id: 'diff',
     descriptionKey: 'contextRail.surface.diff.description',
     defaultWidthFraction: 3 / 5,
@@ -88,7 +98,7 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
     descriptionKey: 'contextRail.surface.editor.description',
     defaultWidthFraction: 3 / 5,
     mode: 'file',
-    icon: 'braces',
+    icon: 'file-edit',
     labelKey: 'contextPanel.mode.files',
     availability: 'always',
   },
@@ -104,9 +114,12 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
   {
     id: 'notes',
     descriptionKey: 'contextRail.surface.notes.description',
-    defaultWidthFraction: 1 / 3,
+    // As wide as the files surface: this panel now carries a sidebar and a
+    // content column, and a third of the window leaves the content column too
+    // narrow to read a note in.
+    defaultWidthFraction: 3 / 5,
     mode: 'notes',
-    icon: 'sticky-note',
+    icon: 'book-marked',
     labelKey: 'contextRail.surface.notes',
     availability: 'always',
   },
@@ -184,10 +197,15 @@ export const sortContextSurfaces = (railOrder: readonly string[]): ContextSurfac
 
 type VisibleRailSurfacesOptions = {
   railOrder: readonly string[];
+  /** Surfaces the user chose to hide from the rail (and from the digit
+      shortcuts, which share this filter). */
+  hiddenSurfaces?: readonly string[];
   planModeEnabled: boolean;
   isVSCode: boolean;
   screenWidth: number;
   tabs: readonly { mode: ContextPanelMode }[];
+  /** Linear's rail icon stays off until a workspace is connected. */
+  linearConnected: boolean;
 };
 
 /**
@@ -200,6 +218,9 @@ type VisibleRailSurfacesOptions = {
  */
 export const getVisibleContextRailSurfaces = (options: VisibleRailSurfacesOptions): ContextSurfaceDescriptor[] => {
   return sortContextSurfaces(options.railOrder).filter((surface) => {
+    if (options.hiddenSurfaces?.includes(surface.id)) {
+      return false;
+    }
     if (surface.id === 'plan' && !options.planModeEnabled) {
       return false;
     }
@@ -214,6 +235,9 @@ export const getVisibleContextRailSurfaces = (options: VisibleRailSurfacesOption
     // not have. Offering the surface anyway would promise the panel people see
     // on the desktop.
     if (surface.id === 'browser' && options.isVSCode) {
+      return false;
+    }
+    if (surface.id === 'linear' && !options.linearConnected) {
       return false;
     }
     if (surface.availability === 'has-content') {
