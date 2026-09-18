@@ -25,6 +25,8 @@ import { DiffViewToggle } from './DiffViewToggle';
 import { VirtualizedCodeBlock, type CodeLine } from './parts/VirtualizedCodeBlock';
 import { JsonTreeView } from '@/components/ui/JsonTreeView';
 import { Icon } from "@/components/icon/Icon";
+import { getToolIcon as getSharedToolIcon } from './parts/toolPresentation';
+import { useGuestToolPresentation } from '@/lib/guests/tool-presentation';
 import { useI18n, type I18nKey, type I18nParams } from '@/lib/i18n';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { MermaidLoadFailure, getMermaidDataUrlSourcePromise, isCurrentMermaidLoadRequest, isMermaidLoadFailure, nextMermaidLoadRequestId } from './toolOutputDialogMermaid';
@@ -88,7 +90,6 @@ const getToolIcon = (toolName: string) => {
     }
     return <Icon name="tools" className={iconClass} />;
 };
-
 const PREVIEW_ANIMATION_MS = 150;
 const MERMAID_DIALOG_HEADER_HEIGHT = 40;
 const MERMAID_ASPECT_RETRY_DELAY_MS = 120;
@@ -427,7 +428,7 @@ const ImagePreviewDialog: React.FC<{
                 className={cn(
                     // Same scrim as DialogOverlay, so the image viewer sits on
                     // the app the way every other dialog does.
-                    'oc-glass-backdrop absolute inset-0 bg-black/25 dark:bg-black/40',
+                    'oc-glass-backdrop absolute inset-0 bg-surface-overlay/60',
                     isTransitioning && 'transition-opacity duration-150 ease-out',
                     isVisible ? 'opacity-100' : 'opacity-0'
                 )}
@@ -440,7 +441,7 @@ const ImagePreviewDialog: React.FC<{
                         type="button"
                         onMouseDown={(event) => event.stopPropagation()}
                         onClick={showPrevious}
-                        className="absolute left-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-black/40 text-foreground/90 hover:bg-black/55 focus:outline-none focus:ring-2 focus:ring-primary/60"
+                        className="absolute left-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-surface-elevated/90 text-surface-elevated-foreground hover:bg-surface-elevated focus:outline-none focus:ring-2 focus:ring-ring"
                         aria-label={t('chat.toolOutputDialog.image.previousAria')}
                     >
                         <Icon name="arrow-left-s" className="h-6 w-6" />
@@ -449,7 +450,7 @@ const ImagePreviewDialog: React.FC<{
                         type="button"
                         onMouseDown={(event) => event.stopPropagation()}
                         onClick={showNext}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-black/40 text-foreground/90 hover:bg-black/55 focus:outline-none focus:ring-2 focus:ring-primary/60"
+                        className="absolute right-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-surface-elevated/90 text-surface-elevated-foreground hover:bg-surface-elevated focus:outline-none focus:ring-2 focus:ring-ring"
                         aria-label={t('chat.toolOutputDialog.image.nextAria')}
                     >
                         <Icon name="arrow-right-s" className="h-6 w-6" />
@@ -477,7 +478,7 @@ const ImagePreviewDialog: React.FC<{
                         </div>
                         <button
                             type="button"
-                            className="h-8 w-8 flex items-center justify-center rounded-lg text-muted-foreground/80 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary/60"
+                            className="h-8 w-8 flex items-center justify-center rounded-lg text-muted-foreground/80 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
                             onClick={() => onOpenChange(false)}
                             aria-label={t('chat.toolOutputDialog.image.closeAria')}
                         >
@@ -887,7 +888,7 @@ const MermaidPreviewDialog: React.FC<{
                     isTransitioning && 'transition-opacity duration-150 ease-out',
                     isVisible ? 'opacity-100' : 'opacity-0'
                 )}
-                style={{ backgroundColor: 'color-mix(in srgb, var(--surface-background) 70%, transparent)' }}
+                style={{ backgroundColor: 'color-mix(in srgb, var(--surface-elevated) 70%, transparent)', color: 'var(--surface-elevated-foreground)' }}
                 onMouseDown={() => onOpenChange(false)}
             />
 
@@ -909,7 +910,7 @@ const MermaidPreviewDialog: React.FC<{
                     <div className="flex items-center justify-end">
                         <button
                             type="button"
-                            className="h-8 w-8 flex items-center justify-center rounded-lg text-muted-foreground/80 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary/60"
+                            className="h-8 w-8 flex items-center justify-center rounded-lg text-muted-foreground/80 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
                             onClick={() => onOpenChange(false)}
                             aria-label={t('chat.toolOutputDialog.mermaid.closeAria')}
                         >
@@ -981,6 +982,8 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
     const { t } = useI18n();
     const [diffViewMode, setDiffViewMode] = React.useState<DiffViewMode>('unified');
     const pierreThemeConfig = usePierreThemeConfig();
+    const popupToolName = typeof popup.metadata?.tool === 'string' ? popup.metadata.tool : null;
+    const popupToolPresentation = useGuestToolPresentation(popupToolName);
 
     React.useEffect(() => {
         if (!popup.open) return;
@@ -1008,7 +1011,7 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
             >
                 <div className="flex-shrink-0 pb-1">
                     <div className="flex items-start gap-2 text-foreground typography-ui-header font-semibold">
-                        {popup.metadata?.tool ? getToolIcon(popup.metadata.tool as string) : (
+                        {popupToolName ? getSharedToolIcon(popupToolName, popupToolPresentation) : (
                             <Icon name="tools" className="h-3.5 w-3.5 text-foreground flex-shrink-0" />
                         )}
                         <span className="break-words flex-1 leading-tight">{popup.title}</span>

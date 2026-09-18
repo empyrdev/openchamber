@@ -231,6 +231,9 @@ export function createMessageQueueRuntime({
   sessionKnowledgeRuntime = null,
   broadcastGlobalUiEvent,
   onPromptSent,
+  // Turns the `openchamber/auto` model into a real one right before the send;
+  // absent means the queue never sees the sentinel.
+  resolvePromptBody = null,
   dataDir,
   fetchImpl = fetch,
   now = Date.now,
@@ -455,9 +458,36 @@ export function createMessageQueueRuntime({
   };
 
   const sendItem = async (sessionId, directory, item) => {
-    const { providerID, modelID, agent, variant } = item.sendConfig;
+    let { providerID, modelID } = item.sendConfig;
+    const { agent, variant } = item.sendConfig;
     const promptFiles = item.attachments.map(toPromptFile);
     const contextMessages = item.context.flatMap(toContextMessages);
+
+    // Queue delivery bypasses the browser-facing proxy route, so apply the
+    // same Auto-model rewrite before choosing the session model. The hook
+    // mutates a route-shaped body; command models are strings while prompts
+    // use the structured pair the prompt route receives.
+    if (resolvePromptBody) {
+      const command = item.text.startsWith('/')
+        ? { model: `${providerID}/${modelID}`, command: item.text.slice(1).split(' ', 1)[0], arguments: item.text.split(' ').slice(1).join(' ') }
+        : { model: { providerID, modelID }, parts: [{ type: 'text', text: item.text }] };
+      await resolvePromptBody(command, { sessionId, directory });
+      const resolvedModel = typeof command.model === 'string'
+        ? (() => {
+          const separator = command.model.indexOf('/');
+          return separator > 0 && separator < command.model.length - 1
+            ? { providerID: command.model.slice(0, separator), modelID: command.model.slice(separator + 1) }
+            : null;
+        })()
+        : asRecord(command.model);
+      const resolvedProviderID = asNonEmptyString(resolvedModel?.providerID);
+      const resolvedModelID = asNonEmptyString(resolvedModel?.modelID);
+      if (!resolvedProviderID || !resolvedModelID) {
+        throw new Error('Auto routing did not resolve a valid model');
+      }
+      providerID = resolvedProviderID;
+      modelID = resolvedModelID;
+    }
 
     // v2 selects model and agent on the session, not per prompt: the choice is
     // switched once and then persists.
@@ -498,7 +528,6 @@ export function createMessageQueueRuntime({
       ? await sessionKnowledgeRuntime.resolvePendingForSession(sessionId, directory)
         .catch(() => ({ text: '', signature: '' }))
       : { text: '', signature: '' };
-
     // Same order as a UI send: everything attached to the message is admitted
     // before the message itself, so the model reads it as background.
     const preamble = [...contextMessages];

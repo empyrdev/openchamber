@@ -86,6 +86,72 @@ const linkAttachmentPart = (part: TextPart): FilePart | null => {
 export const normalizeUserDisplayParts = (parts: Part[]): Part[] => {
     const redundantFileUrls = redundantCommentFileUrls(parts);
     return parts
-        .filter((part) => !(part.type === 'file' && redundantFileUrls.has(part.url)))
-        .map((part) => (part.type === 'text' ? linkAttachmentPart(part) ?? part : part));
+        .filter((part) => {
+            if (part.type === 'file' && redundantFileUrls.has(part.url)) return false;
+            return true;
+        })
+        .map((part) => {
+            const rawPart = part as Record<string, unknown>;
+            if (rawPart.type === 'compaction') {
+                return { type: 'text', text: '/compact' } as Part;
+            }
+            if (rawPart.type === 'text') {
+                const text = typeof rawPart.text === 'string' ? rawPart.text.trim() : '';
+                const synthetic = rawPart.synthetic === true;
+
+                if (synthetic) {
+                    const contextPayload = readContextPart(part);
+                    if (
+                        contextPayload?.kind === 'github-issue'
+                        || contextPayload?.kind === 'github-pr'
+                        || contextPayload?.kind === 'linear-issue'
+                        || contextPayload?.kind === 'guest-issue'
+                        || contextPayload?.kind === 'guest-pr'
+                    ) {
+                        // SAFETY: same display-only file-part shape the legacy
+                        // buildGitHubAttachmentPart produces; consumed by
+                        // FileAttachment, which matches on the mime type.
+                        if (contextPayload.kind === 'linear-issue') {
+                            return {
+                                type: 'file',
+                                mime: 'application/vnd.openchamber.linear-issue-link',
+                                filename: `${contextPayload.identifier}: ${contextPayload.title}`,
+                                url: contextPayload.url,
+                            } as Part;
+                        }
+                        if (contextPayload.kind === 'guest-issue' || contextPayload.kind === 'guest-pr') {
+                            return {
+                                type: 'file',
+                                mime: contextPayload.kind === 'guest-pr'
+                                    ? 'application/vnd.openchamber.guest-pr-link'
+                                    : 'application/vnd.openchamber.guest-issue-link',
+                                filename: contextPayload.kind === 'guest-pr'
+                                    ? `PR ${contextPayload.id}: ${contextPayload.title}`
+                                    : `${contextPayload.id}: ${contextPayload.title}`,
+                                url: contextPayload.url,
+                            } as Part;
+                        }
+                        return {
+                            type: 'file',
+                            mime: contextPayload.kind === 'github-issue'
+                                ? 'application/vnd.github.issue-link'
+                                : 'application/vnd.github.pull-request-link',
+                            filename: contextPayload.kind === 'github-issue'
+                                ? `Issue #${contextPayload.number}: ${contextPayload.title}`
+                                : `PR #${contextPayload.number}: ${contextPayload.title}`,
+                            url: contextPayload.url,
+                        } as Part;
+                    }
+                    if (contextPayload) {
+                        // Other context kinds render through UserContextPart.
+                        return part;
+                    }
+                }
+
+                if (text.startsWith('The following tool was executed by the user')) {
+                    return { type: 'text', text: '/shell' } as Part;
+                }
+            }
+            return part;
+        });
 };

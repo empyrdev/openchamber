@@ -624,7 +624,14 @@ class OpencodeService {
 
   /** Identity of the project a directory belongs to. */
   async getCurrentProject(directory?: string | null): Promise<{ id: string; directory: string; canonical: string }> {
-    return call("project.current", () => this.clientFor(directory).project.current())
+    return call("location.get", async () => {
+      const location = await this.clientFor(directory).location.get()
+      return {
+        id: location.project.id,
+        directory: location.project.directory,
+        canonical: location.project.canonical,
+      }
+    })
   }
 
   async getVcs(directory?: string | null): Promise<Vcs> {
@@ -773,7 +780,7 @@ class OpencodeService {
   }
 
   async renameSession(id: string, title: string, directory?: string | null): Promise<void> {
-    await call("session.rename", () => this.clientFor(directory).session.rename({ sessionID: id, title }))
+    await call("session.update", () => this.clientFor(directory).session.update({ sessionID: id, title }))
   }
 
   async moveSession(id: string, toDirectory: string, options?: { delivery?: SessionInboxDelivery }): Promise<void> {
@@ -815,7 +822,7 @@ class OpencodeService {
   }
 
   async getSessionMessage(id: string, messageID: string, directory?: string | null): Promise<{ info: Message; parts: Part[] }> {
-    const info = await call("session.message", () => this.clientFor(directory).session.message({ sessionID: id, messageID }))
+    const info = await call("session.message.get", () => this.clientFor(directory).session.message.get({ sessionID: id, messageID }))
     const [projected] = projectMessages([info], id)
     return { info: projected.message, parts: projected.parts }
   }
@@ -1075,7 +1082,7 @@ class OpencodeService {
     await call("session.command", () =>
       this.clientFor(params.directory).session.command({
         sessionID: params.id,
-        command: params.command,
+        name: params.command,
         text: params.arguments ?? "",
         files: files.length > 0 ? files : undefined,
         delivery: params.delivery,
@@ -1133,7 +1140,7 @@ class OpencodeService {
     const info = await call("session.fork", () =>
       this.clientFor(directory).session.fork({
         sessionID: sessionId,
-        boundary: boundary.type === "before" ? { type: "before", messageID: boundary.messageID } : { type: "through" },
+        before: boundary.type === "before" ? boundary.messageID : undefined,
       }),
     )
     return projectSession(info)
@@ -1233,7 +1240,7 @@ class OpencodeService {
       this.clientFor(options?.directory).permission.reply({
         sessionID,
         requestID,
-        reply,
+        decision: reply,
         message: options?.message,
       }),
     )
@@ -1318,12 +1325,12 @@ class OpencodeService {
   // -------------------------------------------------------------------------
 
   async replyToForm(sessionID: string, formID: string, answer: FormAnswer, directory?: string | null): Promise<boolean> {
-    await call("form.reply", () => this.clientFor(directory).form.reply({ sessionID, formID, answer }))
+    await call("session.form.reply", () => this.clientFor(directory).session.form.reply({ sessionID, formID, answer }))
     return true
   }
 
   async cancelForm(sessionID: string, formID: string, directory?: string | null): Promise<boolean> {
-    await call("form.cancel", () => this.clientFor(directory).form.cancel({ sessionID, formID }))
+    await call("session.form.cancel", () => this.clientFor(directory).session.form.cancel({ sessionID, formID }))
     return true
   }
 
@@ -1332,8 +1339,8 @@ class OpencodeService {
     const directories = this.uniqueDirectories(options?.directories, options?.includeGlobal)
     const lists = await Promise.all(
       directories.map((directory) =>
-        call("form.request.list", () =>
-          (directory ? this.getScopedSdkClient(directory) : this.client).form.request.list().then((r) => r.data),
+        call("form.list", () =>
+          (directory ? this.getScopedSdkClient(directory) : this.client).form.list().then((r) => r.data),
         ),
       ),
     )

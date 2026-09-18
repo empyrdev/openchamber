@@ -106,6 +106,7 @@ vi.mock('@opencode/client', () => ({
 vi.mock('../git/index.js', () => ({
   createWorktree: (...args) => globalThis.__openchamberCreateWorktreeMock(...args),
   getWorktreeBootstrapStatus: (...args) => globalThis.__openchamberGetWorktreeBootstrapStatusMock(...args),
+  resolvePrimaryWorktreeRoot: async (directory) => ({ root: directory === '/repo/worktrees/side-task' ? '/repo/app' : directory }),
 }));
 
 /**
@@ -401,10 +402,10 @@ describe('openchamber session routes', () => {
       const { app } = createApp();
       await request(app).post('/api/openchamber/sessions/ses_a/metadata').send({ patch: { a: 1 } }).expect(200);
 
-      await expect(request(app).get('/api/openchamber/sessions/ses_a/metadata').expect(200))
-        .resolves.toMatchObject({ body: { metadata: { a: 1 } } });
-      await expect(request(app).get('/api/openchamber/sessions/ses_b/metadata').expect(200))
-        .resolves.toMatchObject({ body: { metadata: {} } });
+      const stored = await request(app).get('/api/openchamber/sessions/ses_a/metadata').expect(200);
+      expect(stored.body).toMatchObject({ metadata: { a: 1 } });
+      const empty = await request(app).get('/api/openchamber/sessions/ses_b/metadata').expect(200);
+      expect(empty.body).toMatchObject({ metadata: {} });
     });
 
     it('rejects a missing or non-object patch', async () => {
@@ -530,6 +531,30 @@ describe('openchamber session routes', () => {
       model: { id: 'gpt-5.5', providerID: 'openai' },
     });
     expect(sessionSwitchAgentMock).toHaveBeenCalledWith({ sessionID: 'ses_123', agent: 'build' });
+  });
+
+  it.each([
+    ['', { projectId: 'proj_1' }],
+    ['', { directory: '/repo/app', worktree: { name: 'side-task' } }],
+    ['', { directory: '/repo/worktrees/side-task' }],
+    ['/ses_existing/send', { directory: '/repo/worktrees/side-task' }],
+    ['/ses_existing/fork', { directory: '/repo/worktrees/side-task' }],
+  ])('prefers project defaults for %s with %j', async (endpoint, scope) => {
+    const { app } = createApp({
+      readSettingsFromDiskMigrated: async () => ({
+        defaultModel: 'openai/gpt-5.5',
+        defaultAgent: 'build',
+        projects: [{ id: 'proj_1', path: '/repo/app', defaultAgent: 'plan' }],
+      }),
+    });
+    const response = await request(app)
+      .post(`/api/openchamber/sessions${endpoint}`)
+      .send({ ...scope, prompt: 'Run this' })
+      .expect(200);
+
+    const sessionID = endpoint.endsWith('/fork') ? 'ses_fork' : endpoint ? 'ses_existing' : 'ses_123';
+    expect(response.body.agent).toBe('plan');
+    expect(sessionSwitchAgentMock).toHaveBeenCalledWith({ sessionID, agent: 'plan' });
   });
 
   it('dispatches an initial prompt when model is provided', async () => {

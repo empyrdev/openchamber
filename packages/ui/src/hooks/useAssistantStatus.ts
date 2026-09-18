@@ -1,4 +1,6 @@
 import React from 'react';
+import { z } from 'zod';
+import { isAutoModel } from '@/lib/routing/autoModel';
 import { useChatColumnSession } from '@/components/chat/chatColumnSession';
 import type { Message, Part, ReasoningPart, TextPart, ToolPart } from '@/lib/opencode/model';
 
@@ -251,6 +253,27 @@ const getToolDisplayName = (part: ToolPart): string => {
     const candidate = part as ToolPart & Partial<{ name?: unknown }>;
     return typeof candidate.name === 'string' ? candidate.name : 'tool';
 };
+
+const modelRefSchema = z.object({ providerID: z.string().trim().min(1), modelID: z.string().trim().min(1) });
+/**
+ * A user message names its model either as the SDK's `model` object, or, on the
+ * optimistic copy the composer inserts before the server echoes it, as
+ * top-level `providerID`/`modelID`. Both are read; the Auto sentinel is flagged.
+ */
+const userMessageModelSchema = z.union([
+    z.object({ model: modelRefSchema }).transform(({ model }) => model),
+    modelRefSchema,
+]);
+
+const readUserMessageModel = (message: Message): { providerId: string; modelId: string; auto: boolean } | null => {
+    const parsed = userMessageModelSchema.safeParse(message);
+    if (!parsed.success) return null;
+    const providerId = parsed.data.providerID;
+    const modelId = parsed.data.modelID;
+    return { providerId, modelId, auto: isAutoModel(providerId, modelId) };
+};
+
+const completedTimeSchema = z.object({ time: z.object({ completed: z.number() }) });
 
 export const getActiveAssistantContext = (messages: Message[]): ActiveAssistantContext => {
     // OpenCode v2 records the provider and model on the assistant message

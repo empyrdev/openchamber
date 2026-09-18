@@ -99,7 +99,6 @@ export type Session = {
   projectID: string
   /** Absolute directory the session runs in (`location.directory` on the wire). */
   directory: string
-  workspaceID?: string
   /** Optional subdirectory inside `directory` the session is scoped to. */
   subpath?: string
   title: string

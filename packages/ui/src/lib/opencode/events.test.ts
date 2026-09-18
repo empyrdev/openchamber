@@ -91,7 +91,7 @@ describe("translateWireEvent", () => {
       ...base,
       type: "session.step.started",
       durable,
-      data: { sessionID: "ses_1", assistantMessageID: "msg_a", agent: "build", model: { id: "m", providerID: "p" } },
+      data: { sessionID: "ses_1", assistantMessageID: "msg_a", agent: "build", model: { id: "m", providerID: "p" }, started: 1000 },
     })
     expect(started).toEqual([
       {
@@ -261,12 +261,6 @@ describe("translateWireEvent", () => {
     for (const [event, kind] of kinds) {
       expect(translateWireEvent(event)).toEqual([{ type: "catalog.updated", properties: { kind } }])
     }
-  })
-
-  test("OpenCode's own catalog.updated is not a refresh signal", () => {
-    // It fires dozens of times while a reply streams and is being removed
-    // upstream; the model list is re-read on credential and config changes.
-    expect(translateWireEvent({ ...base, type: "catalog.updated", data: {} })).toEqual([])
   })
 
   test("mcp status changes stay their own event", () => {

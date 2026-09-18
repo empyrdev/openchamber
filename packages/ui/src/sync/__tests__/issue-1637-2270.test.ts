@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test"
 import type { Session } from "@/lib/opencode/model"
+import type { OpenCodeClient } from "@opencode/client"
 import type { ProjectEntry } from "@/lib/api/types"
 import type { WorktreeMetadata } from "@/types/worktree"
 import { resolveProjectForSessionDirectory } from "@/lib/projectResolution"
@@ -16,11 +17,13 @@ let nextCreateSessionCalls: Array<{ params: unknown; directory: string | null | 
 
 // Configurable current directory (used as fallback when no directoryOverride is set)
 let currentDirectory: string | null = null
+const runtimeSdkClient = {} as OpenCodeClient
 
 let idCounter = 0
 mock.module("@/lib/opencode/client", () => ({
   ascendingId: (prefix: string) => `${prefix}_${(idCounter += 1).toString(16).padStart(12, "0")}`,
   opencodeClient: {
+    getSdkClient: () => runtimeSdkClient,
     getDirectory: () => currentDirectory,
     setDirectory: mock(() => undefined),
     createSession: mock(async (params: unknown, directory?: string | null) => {

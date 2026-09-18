@@ -200,7 +200,6 @@ export function translateWireEvent(event: OpenCodeEvent): SyncEvent[] {
         parentID: event.data.parentID,
         projectID: event.data.projectID,
         directory: event.data.location.directory,
-        workspaceID: event.data.location.workspaceID,
         subpath: event.data.subpath,
         title: event.data.title ?? "",
         agent: event.data.agent,
@@ -274,7 +273,7 @@ export function translateWireEvent(event: OpenCodeEvent): SyncEvent[] {
       ]
     case "session.usage.updated":
       return [sessionEvent(event.data.sessionID, { cost: event.data.cost, tokens: event.data.tokens, time: { updated: event.created } })]
-    case "session.permissions.updated":
+    case "session.permissions":
       return [sessionEvent(event.data.sessionID, { permissions: event.data.permissions })]
     case "session.viewed":
       return [sessionEvent(event.data.sessionID, { time: { viewed: event.created } })]

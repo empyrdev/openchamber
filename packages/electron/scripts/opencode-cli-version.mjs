@@ -8,9 +8,9 @@ const electronPackagePath = path.resolve(__dirname, '..', 'package.json');
 const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
 /**
- * The bundled OpenCode CLI release the desktop app ships. It used to be read
- * from the root `@opencode-ai/sdk` dependency, which OpenCode 2.x no longer
- * publishes, so the desktop package pins the CLI release itself.
+ * The bundled OpenCode CLI release the desktop app ships. The desktop package
+ * pins this release itself so the bundled binary and client wire types move
+ * together.
  */
 export const readPinnedOpenCodeCliVersion = () => {
   const pkg = JSON.parse(fs.readFileSync(electronPackagePath, 'utf8'));

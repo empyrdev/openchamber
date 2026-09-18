@@ -146,7 +146,7 @@ export const SessionErrorNotice: React.FC<SessionErrorNoticeProps> = ({ sessionI
   // A user message that the session is idle on, with nothing after it for a
   // while, is a reply that never began: the send was accepted but OpenCode
   // produced neither a message nor an error for it.
-  const unansweredSince = !reportedError && !storedFailureApplies && isIdle && lastMessage?.role === 'user'
+  const unansweredSince = !reportedError && !storedFailureApplies && isIdle && lastMessage?.role === 'user' && lastMessage.timestamp > 0
     ? lastMessage.timestamp
     : null;
   const [now, setNow] = React.useState(() => Date.now());
