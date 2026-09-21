@@ -128,11 +128,24 @@ const createResult = ({ ok, action, data, error, exitCode }) => ({
   ...(Number.isInteger(exitCode) ? { exitCode } : {}),
 });
 
+// Node reports an IPv4 peer on a dual-stack socket as `::ffff:<ipv4>`.
+const normalizeAddress = (value) => {
+  const address = (asNonEmptyString(value) || '').toLowerCase();
+  return address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+};
+
 const isLoopbackAddress = (value) => {
-  const address = typeof value === 'string' ? value.toLowerCase() : '';
-  return address === '127.0.0.1'
-    || address === '::1'
-    || address === '::ffff:127.0.0.1';
+  const address = normalizeAddress(value);
+  return address === '127.0.0.1' || address === '::1';
+};
+
+const WILDCARD_ADDRESSES = new Set(['0.0.0.0', '::']);
+
+// A wildcard listener answers on loopback. A listener bound to one concrete
+// address answers only there, so that address is the only way back in.
+const resolveConcreteBoundAddress = (value) => {
+  const address = normalizeAddress(value);
+  return address && !WILDCARD_ADDRESSES.has(address) ? address : null;
 };
 
 /**
@@ -225,7 +238,6 @@ const createPluginSource = ({ includeControl, includeWeb, includeMemory }) => {
     entries.push(createToolEntry({
       name: 'openchamber',
       description: CONTROL_TOOL_DESCRIPTION,
-      actions: OPENCHAMBER_AGENT_TOOL_ACTIONS,
       definitions: OPENCHAMBER_AGENT_TOOL_ACTION_DEFINITIONS,
       parameters: CONTROL_PARAMETER_PROPERTIES,
     }));
@@ -234,7 +246,6 @@ const createPluginSource = ({ includeControl, includeWeb, includeMemory }) => {
     entries.push(createToolEntry({
       name: 'openchamber_web',
       description: WEB_TOOL_DESCRIPTION,
-      actions: OPENCHAMBER_WEB_ACTIONS,
       definitions: OPENCHAMBER_WEB_ACTION_DEFINITIONS,
       parameters: WEB_PARAMETER_PROPERTIES,
     }));
@@ -243,7 +254,6 @@ const createPluginSource = ({ includeControl, includeWeb, includeMemory }) => {
     entries.push(createToolEntry({
       name: 'openchamber_memory',
       description: MEMORY_TOOL_DESCRIPTION,
-      actions: OPENCHAMBER_MEMORY_ACTIONS,
       definitions: OPENCHAMBER_MEMORY_ACTION_DEFINITIONS,
       parameters: MEMORY_PARAMETER_PROPERTIES,
     }));
@@ -276,6 +286,7 @@ export const createAgentToolRuntime = (dependencies) => {
     path,
     dataDir,
     getActivePort,
+    getActiveHost = () => null,
     executeAction,
     resolveSessionDirectory,
   } = dependencies;
@@ -321,8 +332,17 @@ export const createAgentToolRuntime = (dependencies) => {
     };
   };
 
+  // The managed child runs on this machine. Reaching a listener bound to one
+  // concrete address makes the OS source the connection from that same address,
+  // so it stands in for loopback there; any other machine arrives as itself.
+  const isSameMachineAddress = (value) => {
+    if (isLoopbackAddress(value)) return true;
+    const boundAddress = getConcreteBoundAddress();
+    return boundAddress !== null && normalizeAddress(value) === boundAddress;
+  };
+
   const authorize = (req) => {
-    if (!activeToken || !isLoopbackAddress(req.socket?.remoteAddress)) return false;
+    if (!activeToken || !isSameMachineAddress(req.socket?.remoteAddress)) return false;
     const header = asNonEmptyString(req.headers?.authorization);
     if (!header?.startsWith('Bearer ')) return false;
     const provided = Buffer.from(header.slice(7));

@@ -106,8 +106,8 @@ export function bootstrapDirectory(input: DirectoryBootstrapInput) {
       return "failed"
     }
   })()
-  // Initialization has its own completion and network capacity. A slow config,
-  // MCP server, or directory cannot hold the session-list scheduler's slot.
+  // Initialization has its own completion and network capacity. A slow config
+  // or directory cannot hold the session-list scheduler's slot.
   const environment = initializeDirectory(input)
   return { sessions, environment }
 }

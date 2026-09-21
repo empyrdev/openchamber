@@ -121,6 +121,11 @@ so a delayed or lost handshake cannot hide an already-materialized transcript
 
 ### Session / project coordination stores
 
+`useMultiRunStore` creates ID-bound multi-run members. `useAgentGroupsStore`
+projects those identities for selection and group deletion, retaining failed
+directory scopes and resetting on runtime changes. Membership, fork handling,
+fusion and legacy compatibility are owned by `lib/multirun/DOCUMENTATION.md`.
+
 `useProjectsStore.hasServerSnapshot` distinguishes a server-confirmed project list from persisted startup hints; `serverSnapshotFailed` records a failed settings sync without clearing the last confirmed list. Successful settings adoption clears that failure even for an unchanged list. Runtime switching clears both flags. Extension project subscriptions consume these flags and project records without changing active selection.
 
 Project parsing, project selection, directory navigation, mobile session paths, and the SDK adapter share `lib/pathNormalization.ts` for request paths. Tilde expansion happens before normalization. Windows drive roots retain their slash, and parent navigation stops at drive and UNC share roots. Selecting a spelling variant of the current directory preserves history and its forward entries. Bare drive-relative paths such as `C:` stay distinct from `C:/`; normalization does not guess their filesystem target.
@@ -184,6 +189,7 @@ User-visible session ordering is also not owned by the global cache array order.
 Global refresh rules:
 
 - The OpenCode `archived` list flag means "also include archived sessions": the server only drops its `time_archived IS NULL` condition. The global cache therefore loads with one inclusive request (`archived: true`) and splits active/archived client-side via `splitGlobalSessionsByArchived` — an `archived: false` request cannot be truthful because the server filter excludes restored sessions (`time.archived` falsy-but-present, see "Restore (unarchive) contract" in `sync/DOCUMENTATION.md`). For callers that still want only archived records, `listGlobalSessionPages` narrows inclusive responses at the data boundary (default `narrowToArchived`), so the archived cache never holds active sessions and no consumer has to re-derive that. Pagination progress stays measured on the raw response, so a page that is full upstream but filtered out here is not mistaken for the last page.
+- The full load paints as it paginates: the first accepted page is merged into the visible lists immediately while the remaining pages keep loading, so a workspace with thousands of sessions is not blank until the last page arrives. That merge is an upsert (never a replacement), leaves `status` at `loading` and `hasLoaded` false, overlays mutations newer than the load baseline, and is excluded from the managed-chats snapshot write — only the complete snapshot is authoritative, persists, and raises ordering baselines.
 - Per-directory refresh issues one inclusive request per directory (previously two), bounded to two requests across callers and prioritizing the current directory.
 - Each directory is an independent completeness scope. A failed directory preserves its previous sessions while successful directories reconcile normally.
 - Fetch failure must remain distinguishable from a successful empty list; failed scopes cannot destructively clear cached sessions.
@@ -210,6 +216,17 @@ Manual model and effort selections survive catalog gaps too. A missing catalog
 entry is not a request to replace a user's choice. Directory snapshots retain
 the effort override separately from its inherited value, including explicit
 `Default`. Fresh drafts inherit their project's effort before the global one.
+
+The agent and the model carry separate provenance. `setAgent` records the agent
+as picked (`agentSelectionSource: 'manual'`) and leaves `selectionSource` to
+describe the model alone, so an agent's pinned model stays inherited and is
+never saved as a per-agent session override. Every path that re-resolves
+defaults (`loadAgents`, the config-defaults reconcile, `loadSessionDefaults`,
+the draft re-apply after activation, the Defaults settings page) keeps a picked
+agent together with the model `setAgent` resolved for it. Only
+`applyDefaultModelAgentSelection` and activating a directory with no snapshot
+clear the pick. An effort picked in a draft is a choice of its own: those same
+paths leave the draft alone while `currentVariantSelection.override` is set.
 
 Project-default editing is available in desktop web and Electron. Hosted mobile
 and Capacitor consume those defaults through the shared composer but have no

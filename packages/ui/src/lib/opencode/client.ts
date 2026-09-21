@@ -11,7 +11,6 @@
  * OpenChamber-owned server routes (`/api/fs/*`, `/api/opencode/*`) also live
  * here when they are part of the same directory/session workflows.
  */
-
 import { ClientError, OpenCode, type OpenCodeClient } from "@opencode/client"
 import type {
   FileDiffInfo,
@@ -38,7 +37,7 @@ import { getRegisteredRuntimeAPIs } from "@/contexts/runtimeAPIRegistry"
 import { markStartupTrace } from "@/lib/startupTrace"
 import { assertProviderCircuitClosed, recordProviderError, recordProviderSuccess } from "./provider-tracker"
 import { normalizePath } from "@/lib/pathNormalization"
-import { activeSessionSnapshotSchema } from "./session-status"
+import { activeSessionSnapshotSchema, hostSessionStatusSnapshotSchema, type HostSessionStatusSnapshot } from "./session-status"
 import {
   compact,
   type Agent,
@@ -412,7 +411,12 @@ const getDesktopFilesApi = (): FilesAPI | null => {
 // /api/fs/home parsing boundary. Older servers answer without chatsRoot;
 // only a valid home response may use the legacy chats-root fallback.
 const fsAbsolutePathSchema = z.string().trim().regex(/^(?:\/|[A-Za-z]:[\\/]|\\\\)/)
-const fsHomeResponseSchema = z.object({ home: fsAbsolutePathSchema, chatsRoot: fsAbsolutePathSchema.optional() })
+const fsHomeResponseSchema = z.object({
+  home: fsAbsolutePathSchema,
+  chatsRoot: fsAbsolutePathSchema.optional(),
+  canonicalChatsRoot: fsAbsolutePathSchema.optional(),
+  canonicalLegacyChatsRoot: fsAbsolutePathSchema.optional(),
+})
 
 /**
  * Metadata crosses the wire as JSON. Round-tripping drops what JSON cannot
@@ -1161,6 +1165,28 @@ class OpencodeService {
       return statuses
     } catch {
       return null
+    }
+  }
+
+  /**
+   * Cross-project busy/retry/idle map kept by the OpenChamber host from the
+   * single upstream event stream. One request that creates no OpenCode
+   * instance, unlike `/session/status?directory=`. `null` means the fetch
+   * failed; callers must preserve their current state.
+   */
+  async getHostSessionStatusSnapshot(): Promise<HostSessionStatusSnapshot | null> {
+    try {
+      const response = await runtimeFetch('/api/sessions/status', {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const parsed = hostSessionStatusSnapshotSchema.safeParse(await response.json().catch(() => null));
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
     }
   }
 

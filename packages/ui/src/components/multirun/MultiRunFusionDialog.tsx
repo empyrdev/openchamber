@@ -12,19 +12,17 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { resolveGlobalSessionDirectory, useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useAllLiveSessions } from '@/sync/sync-context';
+import { getFusionSessionTitle } from '@/lib/multirun/title';
+import { getMultiRunIdentity, isFusionSource } from '@/lib/multirun/identity';
+import { loadFusionOutputs, type FusionSource } from '@/lib/multirun/fusion';
 import { getSyncMessages, getSyncParts } from '@/sync/sync-refs';
 import { flattenAssistantTextParts } from '@/lib/messages/messageText';
-import { getFusionSessionTitle, parseMultiRunSessionTitle } from '@/lib/multirun/title';
+import { registerMultiRunSession } from '@/stores/useMultiRunStore';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 import { renderMagicPrompt } from '@/lib/magicPrompts';
 import { AgentSelector } from './AgentSelector';
 import { ModelMultiSelect, generateInstanceId, type ModelSelectionWithId } from './ModelMultiSelect';
 import { listModelVariantIds, type ModelVariantSource } from '@/lib/modelVariants';
-
-type FusionSource = {
-  session: Session;
-  directory: string | null;
-  projectDirectory: string | null;
-};
 
 const buildSourcePart = (source: FusionSource, text: string, index: number): string => {
   const title = source.session.title?.trim() || source.session.id;
@@ -58,7 +56,6 @@ const getLastAssistantText = async (source: FusionSource): Promise<string> => {
 
   return '';
 };
-
 export function MultiRunFusionDialog({
   session,
   open,
@@ -72,6 +69,7 @@ export function MultiRunFusionDialog({
   const liveSessions = useAllLiveSessions();
   const activeSessions = useGlobalSessionsStore((state) => state.activeSessions);
   const archivedSessions = useGlobalSessionsStore((state) => state.archivedSessions);
+  const sessionsReady = useGlobalSessionsStore((state) => state.status === 'ready');
   const providers = useConfigStore((state) => state.providers);
   const currentProviderId = useConfigStore((state) => state.currentProviderId);
   const currentModelId = useConfigStore((state) => state.currentModelId);
@@ -85,10 +83,11 @@ export function MultiRunFusionDialog({
   ));
   const [variant, setVariant] = React.useState<string>('');
   const [agent, setAgent] = React.useState(currentAgentName ?? '');
-  const [sources, setSources] = React.useState<FusionSource[]>([]);
+  const [excludedSources, setExcludedSources] = React.useState<string[]>([]);
   const [isStarting, setIsStarting] = React.useState(false);
 
-  const parsed = React.useMemo(() => parseMultiRunSessionTitle(session.title), [session.title]);
+  const parsed = React.useMemo(() => getMultiRunIdentity(session,
+    getSessionProjectDirectory(session.id, session.directory) ?? session.directory), [session]);
   const allSessions = React.useMemo(() => {
     const byId = new Map<string, Session>();
     for (const candidate of liveSessions) byId.set(candidate.id, candidate);
@@ -98,27 +97,23 @@ export function MultiRunFusionDialog({
     return Array.from(byId.values());
   }, [activeSessions, archivedSessions, liveSessions, session]);
 
-  React.useEffect(() => {
-    if (!open || !parsed) return;
-
-    const currentDirectory = useSessionUIStore.getState().getDirectoryForSession(session.id);
-    const currentProjectDirectory = getSessionProjectDirectory(session.id, currentDirectory);
-    const nextSources = allSessions
+  React.useEffect(() => { setExcludedSources([]); }, [open, session.id]);
+  const sources = React.useMemo(() => {
+    if (!open || !parsed) return [];
+    return allSessions
       .map((candidate): FusionSource | null => {
-        const candidateParsed = parseMultiRunSessionTitle(candidate.title);
-        if (!candidateParsed || candidateParsed.groupSlug !== parsed.groupSlug || candidateParsed.fusion) return null;
-        if ((candidateParsed.runGroup ?? null) !== (parsed.runGroup ?? null)) return null;
+        if (excludedSources.includes(candidate.id)) return null;
         const directory = useSessionUIStore.getState().getDirectoryForSession(candidate.id)
           ?? resolveGlobalSessionDirectory(candidate);
         const projectDirectory = getSessionProjectDirectory(candidate.id, directory);
-        if (currentProjectDirectory && projectDirectory && currentProjectDirectory !== projectDirectory) return null;
-        return { session: candidate, directory, projectDirectory };
+        const identity = getMultiRunIdentity(candidate, projectDirectory ?? candidate.directory);
+        if (!identity || !isFusionSource(parsed, identity)) return null;
+        return { session: candidate, directory, projectDirectory, identity };
       })
       .filter((source): source is FusionSource => source !== null)
       .sort((a, b) => (a.session.time?.created ?? 0) - (b.session.time?.created ?? 0));
 
-    setSources(nextSources);
-  }, [allSessions, open, parsed, session.id]);
+  }, [allSessions, open, parsed, excludedSources]);
 
   const selectedProvider = providers.find((provider) => provider.id === providerID);
   const selectedProviderModel = selectedProvider?.models.find((model) => model.id === modelID) as { variants?: ModelVariantSource } | undefined;
@@ -135,13 +130,14 @@ export function MultiRunFusionDialog({
   const selectedModelLabel = selectedModelSelection[0]?.displayName || selectedModelSelection[0]?.modelID || t('multirun.fusion.model.placeholder');
 
   const handleStart = async () => {
-    if (!parsed || !providerID || !modelID) return;
+    if (!parsed || !canStart) return;
+    const runtimeKey = getRuntimeKey();
+    const assertCurrent = () => {
+      if (getRuntimeKey() !== runtimeKey) throw new Error('Runtime changed');
+    };
     setIsStarting(true);
     try {
-      const sourceTexts = await Promise.all(sources.map((source) => getLastAssistantText(source)));
-      const usableSources = sources
-        .map((source, index) => ({ source, text: sourceTexts[index] ?? '' }))
-        .filter((item) => item.text.trim().length > 0);
+      const usableSources = await loadFusionOutputs(sources, parsed, assertCurrent);
 
       if (usableSources.length === 0) {
         toast.error(t('multirun.fusion.toast.noOutputs'));
@@ -149,6 +145,7 @@ export function MultiRunFusionDialog({
       }
 
       const directory = sources[0]?.projectDirectory ?? sources[0]?.directory ?? null;
+      if (!directory) throw new Error('Fusion requires a session directory');
       const fusionTitle = getFusionSessionTitle(parsed.groupSlug, providerID, modelID, parsed.runGroup);
       const [visiblePrompt, instructionsPrompt] = await Promise.all([
         renderMagicPrompt('session.fusion.visible'),
@@ -163,7 +160,9 @@ export function MultiRunFusionDialog({
       useSessionUIStore.getState().setCurrentSession(fusionSession.id, directory);
       onOpenChange(false);
 
+      assertCurrent();
       await opencodeClient.sendMessage({
+        runtimeKey,
         id: fusionSession.id,
         providerID,
         model: { providerID, id: modelID, variant: variant || undefined },
@@ -174,9 +173,10 @@ export function MultiRunFusionDialog({
           ...usableSources.map((item, index) => ({ text: buildSourcePart(item.source, item.text, index) })),
           { text: '\n\n--- FUSION INPUTS END ---\nNow write the final fused answer.' },
         ],
-        directory: directory ?? opencodeClient.getDirectory(),
+        directory,
       });
     } catch (error) {
+      if (getRuntimeKey() !== runtimeKey) return;
       console.error('[MultiRunFusion] Failed to start fusion', error);
       toast.error(t('multirun.fusion.toast.failed'));
     } finally {
@@ -235,9 +235,9 @@ export function MultiRunFusionDialog({
           <div className="max-h-56 space-y-1 overflow-auto rounded-lg border border-[var(--interactive-border)] p-1">
             {sources.map((source) => (
               <div key={source.session.id} className="flex items-center gap-2 rounded-md px-2 py-1.5 typography-meta">
-                <ProviderLogo providerId={parseMultiRunSessionTitle(source.session.title)?.providerID ?? ''} className="h-4 w-4" />
+                <ProviderLogo providerId={source.identity.providerID} className="h-4 w-4" />
                 <span className="min-w-0 flex-1 truncate">{source.session.title || source.session.id}</span>
-                <button type="button" onClick={() => setSources((prev) => prev.filter((item) => item.session.id !== source.session.id))} className="text-muted-foreground hover:text-foreground">
+                <button type="button" onClick={() => setExcludedSources((prev) => [...prev, source.session.id])} className="text-muted-foreground hover:text-foreground">
                   <Icon name="close" className="h-4 w-4" />
                 </button>
               </div>

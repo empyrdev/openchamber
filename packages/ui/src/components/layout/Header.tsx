@@ -15,14 +15,14 @@ import {
 } from '@/components/ui/dropdown-menu';
 
 import { useUIStore, type ContextPanelMode } from '@/stores/useUIStore';
-import { useConfigStore } from '@/stores/useConfigStore';
+import { useContextWindowLimits } from '@/hooks/useContextWindowLimits';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSessionWorktreeStore } from '@/sync/session-worktree-store';
 import { formatSessionWorktreeBadge } from '@/sync/session-worktree-contract';
-import { buildSessionMessageRecordsSnapshot, useDirectoryStore, useGlobalSessionStatus, useSessionMessagesResolved } from '@/sync/sync-context';
+import { useGlobalSessionStatus, useSessionMessagesResolved } from '@/sync/sync-context';
 import { useDirectoryStore as useAppDirectoryStore } from '@/stores/useDirectoryStore';
 import { isChatDirectoryForHome } from '@/lib/chatDirectories';
-import { useSync } from '@/sync/use-sync';
+import { useSessionMessageRecordsForExport } from '@/sync/use-sync';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useQuotaAutoRefresh, useQuotaStore } from '@/stores/useQuotaStore';
 import { useGitBranchLabel } from '@/stores/useGitStore';
@@ -281,8 +281,6 @@ export const Header: React.FC = () => {
   const shortcutOverrides = useUIStore((state) => state.shortcutOverrides);
   const sessionTabsEnabled = useUIStore((state) => state.sessionTabsEnabled);
 
-  const getCurrentModel = useConfigStore((state) => state.getCurrentModel);
-
   const getContextUsage = useSessionUIStore((state) => state.getContextUsage);
   const isNewSessionDraftOpen = useSessionUIStore((state) => Boolean(state.newSessionDraft?.open));
   const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
@@ -384,12 +382,7 @@ export const Header: React.FC = () => {
     setIsDesktopApp(isDesktopShell());
   }, []);
 
-  const currentModel = getCurrentModel();
-  const limit = currentModel && typeof currentModel.limit === 'object' && currentModel.limit !== null
-    ? (currentModel.limit as Record<string, unknown>)
-    : null;
-  const contextLimit = (limit && typeof limit.context === 'number' ? limit.context : 0);
-  const outputLimit = (limit && typeof limit.output === 'number' ? limit.output : 0);
+  const { context: contextLimit, output: outputLimit } = useContextWindowLimits(currentSessionId);
   const contextUsage = getContextUsage(contextLimit, outputLimit);
   const [stableDesktopContextUsage, setStableDesktopContextUsage] = React.useState<SessionContextUsage | null>(null);
   const isContextUsageResolvedForSession = !currentSessionId || currentSessionMessagesResolved;
@@ -748,8 +741,7 @@ export const Header: React.FC = () => {
     const trimmedTitle = currentSession?.title?.trim();
     return trimmedTitle && trimmedTitle.length > 0 ? trimmedTitle : 'Untitled Session';
   }, [activeProjectLabel, currentSession?.title, currentSessionId]);
-  const headerDirectoryStore = useDirectoryStore(openDirectory || undefined, { bootstrap: false });
-  const sync = useSync();
+  const loadSessionRecords = useSessionMessageRecordsForExport();
   const updateSessionTitle = useSessionUIStore((state) => state.updateSessionTitle);
   const archiveSessions = useSessionUIStore((state) => state.archiveSessions);
   const deleteSessions = useSessionUIStore((state) => state.deleteSessions);
@@ -830,13 +822,11 @@ export const Header: React.FC = () => {
       toast.error(t('sessions.sidebar.session.export.nothingToExport'));
       return;
     }
-    try {
-      await sync.loadCompleteHistory(currentSessionId, openDirectory);
-    } catch {
+    const records = await loadSessionRecords({ sessionID: currentSessionId, directory: openDirectory }).catch(() => null);
+    if (!records) {
       toast.error(t('sessions.sidebar.session.export.failedLoadHistory'));
       return;
     }
-    const records = buildSessionMessageRecordsSnapshot(headerDirectoryStore.getState(), currentSessionId).list;
     if (records.length === 0) {
       toast.error(t('sessions.sidebar.session.export.nothingToExport'));
       return;
@@ -846,7 +836,7 @@ export const Header: React.FC = () => {
     const savedPath = await saveAsMarkdownDesktop(markdown, filename);
     if (!savedPath) downloadAsMarkdown(markdown, filename);
     toast.success(t('sessions.sidebar.session.export.success'));
-  }, [currentSession?.title, currentSessionId, headerDirectoryStore, openDirectory, sync, t]);
+  }, [currentSession?.title, currentSessionId, loadSessionRecords, openDirectory, t]);
 
   // Extension session actions on the current session. The conversation is
   // loaded the same way Export as Markdown loads it.
@@ -861,15 +851,14 @@ export const Header: React.FC = () => {
       loadRecords: async () => {
         if (!openDirectory) return null;
         try {
-          await sync.loadCompleteHistory(currentSessionId, openDirectory);
+          return await loadSessionRecords({ sessionID: currentSessionId, directory: openDirectory });
         } catch {
           return null;
         }
-        return buildSessionMessageRecordsSnapshot(headerDirectoryStore.getState(), currentSessionId).list;
       },
       onLoadFailed: () => toast.error(t('sessions.sidebar.session.export.failedLoadHistory')),
     });
-  }, [currentSession?.title, currentSessionId, headerDirectoryStore, openDirectory, sessionDirectory, sync, t]);
+  }, [currentSession?.title, currentSessionId, loadSessionRecords, openDirectory, sessionDirectory, t]);
   const renderGuestSessionActionItems = React.useCallback((Item: React.ElementType) => guestSessionActionEntries.map((entry) => (
     <Item key={`${entry.guest.id}:${entry.action.id}`} onClick={() => runCurrentSessionGuestAction(entry)}>
       <GuestIcon icon={entry.icon} iconSrc={entry.iconSrc} className="mr-1 size-4" />{entry.action.label}
@@ -1444,9 +1433,9 @@ export const Header: React.FC = () => {
                     <Icon name="close" className="size-4" />
                   </button>
                 </form>
-              ) : (
+              ) : isNewSessionDraftOpen ? null : (
                 <span className="truncate typography-ui-label text-[14px] font-normal leading-tight text-foreground max-w-full">
-                  {isNewSessionDraftOpen ? t('sessions.switcher.draftTitle') : currentSessionTitle}
+                  {currentSessionTitle}
                 </span>
               )}
               {showHeaderMetaRow ? (

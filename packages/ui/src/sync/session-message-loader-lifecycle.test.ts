@@ -1,14 +1,12 @@
 import { expect, test } from 'bun:test'
-import { createStore } from 'zustand/vanilla'
-
 import type { MessagePage } from '@/lib/opencode/client'
 import { SessionMessageLoader } from './session-message-loader'
+import { ChildStoreManager } from './child-store'
 
 const emptyPage: MessagePage = { items: [], cursor: {} }
 
 test('loads messages after a Strict Mode cleanup and effect setup', async () => {
-  const store = createStore(() => ({ message: {}, part: {} }))
-  const childStores = { ensureChild: () => store, getChild: () => store }
+  const childStores = new ChildStoreManager()
   let messageRequests = 0
   let resolveFirstRequest: ((value: MessagePage) => void) | undefined
   const sdk = { getSessionMessages: async () => {

@@ -82,6 +82,9 @@ const withDirectorySessionRefreshSlot = async <T>(task: () => Promise<T>): Promi
 };
 
 let inflightLoad: Promise<LoadResult> | null = null;
+// True while a page of an unfinished load is being merged. The managed-chats
+// snapshot is written from complete loads only, never from a partial list.
+let mergingSessionPage = false;
 // Bumped on runtime switch: an in-flight load from the previous instance must
 // not apply its (stale) snapshot after the reset.
 let loadGeneration = 0;
@@ -317,6 +320,9 @@ const applySnapshot = (
   activeSessions: Session[],
   archivedSessions: Session[],
   status: GlobalSessionsStatus,
+  /** False for a partial page merged mid-load: the lists are incomplete, so
+      they must not claim the authority `hasLoaded` grants. */
+  markLoaded = true,
 ): Partial<GlobalSessionsState> | GlobalSessionsState => {
   if (isVSCodeRuntime()) {
     activeSessions = filterManagedChatsForRuntime(activeSessions, true);
@@ -348,7 +354,7 @@ const applySnapshot = (
     && nextArchivedSessions === state.archivedSessions
     && nextSessionsByDirectory === state.sessionsByDirectory
     && nextReviewTransferMap === state.reviewTransferBySessionId
-    && state.hasLoaded
+    && (state.hasLoaded || !markLoaded)
     && state.status === status
   ) {
     return state;
@@ -361,9 +367,33 @@ const applySnapshot = (
     structure: nextStructure,
     sessionsByDirectory: nextSessionsByDirectory,
     reviewTransferBySessionId: nextReviewTransferMap,
-    hasLoaded: true,
+    hasLoaded: markLoaded ? true : state.hasLoaded,
     status,
   };
+};
+
+/**
+ * Merge one page of an in-flight global load into the visible lists. Never a
+ * replacement: the store may already hold the persisted managed-chats seed and
+ * earlier pages, and those must stay visible while pagination continues.
+ * Sessions the page reclassifies move buckets; mutations newer than the load's
+ * baseline win, so an archive or delete made while the page was in flight is
+ * not undone.
+ */
+const mergeSessionPage = (
+  state: GlobalSessionsState,
+  active: Session[],
+  archived: Session[],
+  baselineRevision: number,
+): Partial<GlobalSessionsState> | GlobalSessionsState => {
+  const incomingActiveIds = new Set(active.map((session) => session.id));
+  const incomingArchivedIds = new Set(archived.map((session) => session.id));
+  const mergedActive = mergeSessionLists(state.activeSessions, active)
+    .filter((session) => !incomingArchivedIds.has(session.id));
+  const mergedArchived = mergeSessionLists(state.archivedSessions, archived)
+    .filter((session) => !incomingActiveIds.has(session.id));
+  const reconciled = overlayMutationsSince(state, mergedActive, mergedArchived, baselineRevision);
+  return applySnapshot(state, reconciled.activeSessions, reconciled.archivedSessions, state.status, false);
 };
 
 const overlayMutationsSince = (
@@ -648,6 +678,7 @@ export const useGlobalSessionsStore = create<GlobalSessionsState>((set, get) => 
     const generation = loadGeneration;
     const baselineRevision = get().mutationRevision;
     const loadPromise = (async () => {
+      let firstPageMerged = false;
       let rootsReady = false;
       try {
         await ensureChatsRootDirectory();
@@ -659,6 +690,17 @@ export const useGlobalSessionsStore = create<GlobalSessionsState>((set, get) => 
         // OpenChamber's own, so the server list cannot filter on it.
         const allSessions = await listGlobalSessionPages(listSessionPage, {
           pageSize: PAGE_SIZE,
+          onPage: (page) => {
+            if (firstPageMerged || generation !== loadGeneration) return;
+            firstPageMerged = true;
+            const firstPage = splitGlobalSessionsByArchived(page);
+            mergingSessionPage = true;
+            try {
+              set((state) => mergeSessionPage(state, firstPage.active, firstPage.archived, baselineRevision));
+            } finally {
+              mergingSessionPage = false;
+            }
+          },
         });
 
         if (generation !== loadGeneration) {
@@ -856,7 +898,8 @@ export const useGlobalSessionsStore = create<GlobalSessionsState>((set, get) => 
 useGlobalSessionsStore.subscribe((state, previous) => {
   countSyncPerformance('globalSessionPublications');
   if (
-    getChatsRootForHome(null) !== null
+    !mergingSessionPage
+    && getChatsRootForHome(null) !== null
     && (state.activeSessions !== previous.activeSessions
       || (!state.managedChatsHydrated && state.mutationRevision !== previous.mutationRevision)
       || (state.hasLoaded && !previous.hasLoaded))

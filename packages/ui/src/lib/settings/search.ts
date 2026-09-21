@@ -121,6 +121,13 @@ const SETTINGS_SEARCH_ITEMS: readonly SettingsSearchItem[] = [
     isAvailable: (ctx) => ctx.isMobile && ctx.isWeb && !ctx.isDesktop && !ctx.isVSCode,
   },
   {
+    id: 'appearance.animated-activity-indicators',
+    page: 'appearance',
+    titleKey: 'settings.openchamber.visual.field.animatedActivityIndicators',
+    descriptionKey: 'settings.openchamber.visual.field.animatedActivityIndicatorsInfo',
+    keywords: ['spinner', 'animation', 'session', 'activity', 'motion', 'running', 'indicator'],
+  },
+  {
     id: 'appearance.interface-font-size',
     page: 'appearance',
     titleKey: 'settings.openchamber.visual.field.interfaceFontSize',
@@ -408,6 +415,7 @@ const SETTINGS_SEARCH_ITEMS: readonly SettingsSearchItem[] = [
     titleKey: 'settings.openchamber.visual.field.enterToSend',
     descriptionKey: 'settings.openchamber.visual.field.enterToSendHint',
     keywords: ['enter', 'shift enter', 'ctrl enter', 'cmd enter', 'mod enter', 'send', 'newline'],
+    isAvailable: (ctx) => !ctx.isMobile,
   },
   {
     id: 'sessions.default-model',
@@ -564,6 +572,14 @@ const SETTINGS_SEARCH_ITEMS: readonly SettingsSearchItem[] = [
     titleKey: 'settings.openchamber.tools.field.agentWebTool',
     descriptionKey: 'settings.openchamber.tools.field.agentWebToolInfo',
     keywords: ['agent', 'tool', 'web', 'browser', 'page', 'preview', 'openchamber'],
+    isAvailable: (ctx) => !ctx.isVSCode,
+  },
+  {
+    id: 'sessions.browser-provider',
+    page: 'general',
+    titleKey: 'settings.openchamber.tools.browserProvider.label',
+    descriptionKey: 'settings.openchamber.tools.browserProvider.info',
+    keywords: ['agent', 'browser', 'provider', 'extension', 'chrome', 'server', 'headless'],
     isAvailable: (ctx) => !ctx.isVSCode,
   },
   {

@@ -359,9 +359,13 @@ const buildGitEnv = async () => {
   return env;
 };
 
-const createGit = async (directory, { allowUnsafeSshCommand = false, allowUnsafeCredentialHelper = false } = {}) => {
+const createGit = async (directory, { allowUnsafeSshCommand = false, allowUnsafeCredentialHelper = false, stallTimeoutMs = 0 } = {}) => {
   const env = await buildGitEnv();
   const spawnOptions = { windowsHide: true };
+  // simple-git's block timeout kills the process once it has produced no
+  // output for this long. Opt-in per caller: a background read must never hold
+  // a limiter slot forever, while a silent long push or fetch must not be cut.
+  const timeout = stallTimeoutMs > 0 ? { block: stallTimeoutMs } : undefined;
   const binary = getGitBinary();
   const hasCustomBinary = typeof binary === 'string' && binary.trim() && binary !== 'git' && binary !== 'git.exe';
   const unsafe = hasCustomBinary || allowUnsafeSshCommand || allowUnsafeCredentialHelper
@@ -386,6 +390,7 @@ const createGit = async (directory, { allowUnsafeSshCommand = false, allowUnsafe
     spawnOptions,
     binary,
     unsafe,
+    ...(timeout ? { timeout } : {}),
   });
 };
 
@@ -491,14 +496,14 @@ const resolveGitRepositoryRoot = async (directoryPath, git) => {
     : path.resolve(directoryPath, normalizedTopLevel);
 };
 
-const createRepositoryGitContext = async (directory) => {
+const createRepositoryGitContext = async (directory, gitOptions = {}) => {
   const directoryPath = normalizeDirectoryPath(directory);
   if (typeof directoryPath !== 'string' || !directoryPath.trim()) {
     throw new Error('Git directory is required');
   }
-  const directoryGit = await createGit(directoryPath);
+  const directoryGit = await createGit(directoryPath, gitOptions);
   const repoRoot = await resolveGitRepositoryRoot(directoryPath, directoryGit);
-  const git = path.resolve(directoryPath) === repoRoot ? directoryGit : await createGit(repoRoot);
+  const git = path.resolve(directoryPath) === repoRoot ? directoryGit : await createGit(repoRoot, gitOptions);
   return { directoryPath, directoryGit, repoRoot, git };
 };
 
@@ -1014,13 +1019,16 @@ const isMissingDirectoryError = (error) => {
   return /directory that does not exist|does not exist|no such file or directory/i.test(text);
 };
 
-const runGitCommand = async (cwd, args) => {
+const runGitCommand = async (cwd, args, { timeoutMs = 0 } = {}) => {
   try {
     const { stdout, stderr } = await execFileAsync(getGitBinary(), args, {
       cwd,
       env: await buildGitEnv(),
       windowsHide: true,
       maxBuffer: 20 * 1024 * 1024,
+      // Only short probes pass a timeout; commands that legitimately run long
+      // (a fetch into a temporary clone) keep the default of none.
+      ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
     });
     return {
       success: true,
@@ -2147,14 +2155,45 @@ const applyUpstreamConfiguration = async (args) => {
   );
 };
 
+/**
+ * A repository whose root is the user's home directory or a filesystem root
+ * (`C:\`, `/`) covers the whole disk. Every status read walks Program Files
+ * or the entire home tree, which is minutes of Git work per refresh and, on
+ * Windows, the process pile-ups users report. Such a repository is nearly
+ * always an accidental `git init` in the wrong place, so OpenChamber treats
+ * it as no repository at all. Returns the reason or null for a normal root.
+ */
+export const unsupportedRepositoryRootReason = (repoRoot, home = os.homedir()) => {
+  if (typeof repoRoot !== 'string' || !repoRoot.trim()) return null;
+  const resolved = path.resolve(repoRoot.trim());
+  if (path.resolve(path.parse(resolved).root) === resolved) return 'filesystem-root';
+  if (typeof home === 'string' && home.trim() && path.resolve(home.trim()) === resolved) return 'home';
+  return null;
+};
+
+const warnedUnsupportedRoots = new Set();
+
 export async function isGitRepository(directory) {
   const directoryPath = normalizeDirectoryPath(directory);
   if (!directoryPath || !fs.existsSync(directoryPath)) {
     return false;
   }
 
-  const result = await runGitCommand(directoryPath, ['rev-parse', '--git-dir']);
-  return result.success;
+  const result = await runGitCommand(directoryPath, ['rev-parse', '--git-dir'], { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+  if (!result.success) return false;
+
+  // `--show-toplevel` has no answer inside a bare repository or a .git
+  // directory; those keep the previous answer rather than being rejected.
+  const topLevel = await runGitCommand(directoryPath, ['rev-parse', '--show-toplevel'], { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+  if (!topLevel.success) return true;
+  const repoRoot = topLevel.stdout.trim();
+  const reason = unsupportedRepositoryRootReason(repoRoot);
+  if (!reason) return true;
+  if (!warnedUnsupportedRoots.has(repoRoot)) {
+    warnedUnsupportedRoots.add(repoRoot);
+    console.warn(`[git] Ignoring repository rooted at ${repoRoot} (${reason}): Git features are disabled for ${directoryPath}`);
+  }
+  return false;
 }
 
 export async function getGlobalIdentity() {
@@ -2282,7 +2321,38 @@ export async function setLocalIdentity(directory, profile) {
 // .gitignore.
 const UNTRACKED_DIRECTORY_EXPANSION_LIMIT = 1000;
 
+// A status read holds one of MAX_CONCURRENT_STATUS_READS slots until it
+// finishes. Git never gets a terminal here, but a process can still hang on
+// Windows (a locked index, a stuck filesystem monitor, an unreachable network
+// drive), and a hung process would hold its slot forever: four of them and no
+// status read runs again until someone kills them by hand. Every process the
+// read spawns is therefore killed when it stops producing output for this long,
+// and the read fails instead of wedging the limiter. Two minutes is far above
+// what a healthy read spends silent, even on a very large tree.
+const GIT_STATUS_STALL_TIMEOUT_MS = 120_000;
+const GIT_UNTRACKED_LISTING_STALL_TIMEOUT_MS = 60_000;
+const GIT_PROBE_TIMEOUT_MS = 30_000;
+
 // Untracked files under `dirPath` (repository-relative, trailing slash), read
+// Git for Windows runs commands through a launcher: the `git.exe` we spawn is a
+// wrapper whose child is the real `git`. Killing only the wrapper leaves that
+// child alive, still walking the tree on its own (a repository rooted at a
+// drive root sends it through Program Files), and it shows up in Task Manager
+// as a stuck pair until someone ends it by hand. Windows has no process groups
+// to signal, so the tree is ended through taskkill.
+const killProcessTree = (child) => {
+  if (!child.pid) return;
+  if (process.platform === 'win32') {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }).on('error', () => {});
+    } catch {
+      child.kill('SIGKILL');
+    }
+    return;
+  }
+  child.kill('SIGKILL');
+};
+
 // from a streamed `ls-files` that is stopped once the bound is exceeded so a
 // huge directory is never listed in full. `paths` is complete when
 // `truncated` is false.
@@ -2299,16 +2369,29 @@ const listUntrackedFilesBounded = async (repoRoot, dirPath, limit) => {
     let pending = '';
     let truncated = false;
     let settled = false;
+    let stallTimer = null;
     const finish = (error) => {
       if (settled) return;
       settled = true;
+      if (stallTimer) clearTimeout(stallTimer);
       if (error) {
         reject(error);
         return;
       }
       resolve({ paths, truncated });
     };
+    // A listing that goes silent is killed rather than left holding the
+    // status read (and its limiter slot) open.
+    const armStallTimer = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        killProcessTree(child);
+        finish(new Error(`git ls-files produced no output for ${GIT_UNTRACKED_LISTING_STALL_TIMEOUT_MS}ms in ${dirPath}`));
+      }, GIT_UNTRACKED_LISTING_STALL_TIMEOUT_MS);
+    };
+    armStallTimer();
     child.stdout.on('data', (chunk) => {
+      armStallTimer();
       if (truncated) return;
       pending += chunk.toString('utf8');
       const records = pending.split('\0');
@@ -2318,7 +2401,7 @@ const listUntrackedFilesBounded = async (repoRoot, dirPath, limit) => {
         paths.push(record);
         if (paths.length > limit) {
           truncated = true;
-          child.kill();
+          killProcessTree(child);
           finish();
           return;
         }
@@ -2426,7 +2509,9 @@ async function readStatus(normalizedDirectory, lightMode) {
       throw new Error('fatal: not a git repository (or any of the parent directories): .git');
     }
 
-    const { directoryPath, repoRoot, git } = await createRepositoryGitContext(normalizedDirectory);
+    const { directoryPath, repoRoot, git } = await createRepositoryGitContext(normalizedDirectory, {
+      stallTimeoutMs: GIT_STATUS_STALL_TIMEOUT_MS,
+    });
 
     // `-unormal` lists a directory with no tracked files as one `dir/` entry
     // and stops walking it at its first file. `-uall` would walk every file

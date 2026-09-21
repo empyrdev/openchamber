@@ -8,6 +8,12 @@ const worktreeMetadataCalls: Array<{ sessionId: string; path: string }> = [];
 const worktreeCreateCalls: Array<{ project: { id?: string; path: string }; args: Record<string, unknown>; options: unknown }> = [];
 const worktreeBootstrapWaitCalls: string[] = [];
 const operationOrder: string[] = [];
+const dispatchedSessionIds: string[] = [];
+const deletedSessionIds: string[] = [];
+const createdSessionIds: string[] = [];
+let createdCount = 0;
+let rejectNextMembership = false;
+let onCreate = () => {};
 let isGitRepository = false;
 let waitForWorktreeSetup = false;
 const createWorktreeWithDefaultsMock = mock((project: { id?: string; path: string }, args: Record<string, unknown>, options: unknown) => {
@@ -30,10 +36,12 @@ const childState = {
   sessionTotal: 0,
   limit: 5,
 };
-let currentDirectory = '/repo';
+let storedSession: Session;
+const sdkClient = {};
+let activeClient: object = sdkClient;
 
 mock.module('@/sync/session-ui-store', () => ({
-  routeMessage: mock(() => Promise.resolve()),
+  routeMessage: async ({ sessionId }: { sessionId: string }) => { dispatchedSessionIds.push(sessionId); },
   useSessionUIStore: {
     getState: () => ({
       markSessionAsOpenChamberCreated: mock(() => undefined),
@@ -46,23 +54,23 @@ mock.module('@/sync/session-ui-store', () => ({
 
 mock.module('@/lib/opencode/client', () => ({
   opencodeClient: {
-    withDirectory: async (directory: string, fn: () => Promise<Session>) => {
-      const previous = currentDirectory;
-      currentDirectory = directory;
-      try {
-        return await fn();
-      } finally {
-        currentDirectory = previous;
-      }
+    getSdkClient: () => activeClient,
+    createSession: async ({ id, title, metadata }: { id?: string; title?: string; metadata?: Session['metadata'] }, directory: string) => {
+      operationOrder.push(`createSession:${directory}`);
+      createdCount += 1;
+      const sessionID = id ?? `missing-${createdCount}`;
+      createdSessionIds.push(sessionID);
+      storedSession = {
+        id: sessionID, projectID: 'p', directory, title: title ?? '', metadata: rejectNextMembership ? undefined : metadata,
+        cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: 1, updated: 1 },
+      };
+      rejectNextMembership = false;
+      onCreate();
+      return storedSession;
     },
-    createSession: async (params?: { title?: string }): Promise<Session> => {
-      operationOrder.push(`createSession:${currentDirectory}`);
-      return {
-        id: 'ses_multirun',
-        title: params?.title ?? '',
-        directory: currentDirectory,
-        time: { created: 1, updated: 1 },
-      } as Session;
+    deleteSession: async (id: string) => {
+      deletedSessionIds.push(id);
+      return true;
     },
   },
 }));
@@ -157,12 +165,18 @@ describe('useMultiRunStore', () => {
     worktreeCreateCalls.length = 0;
     worktreeBootstrapWaitCalls.length = 0;
     operationOrder.length = 0;
+    dispatchedSessionIds.length = 0;
+    deletedSessionIds.length = 0;
+    createdSessionIds.length = 0;
+    createdCount = 0;
+    rejectNextMembership = false;
+    activeClient = sdkClient;
+    onCreate = () => {};
     isGitRepository = false;
     waitForWorktreeSetup = false;
     childState.session = [];
     childState.sessionTotal = 0;
     childState.limit = 5;
-    currentDirectory = '/repo';
     useMultiRunStore.setState({ isLoading: false, error: null });
   });
 
@@ -176,11 +190,44 @@ describe('useMultiRunStore', () => {
       }],
     });
 
-    expect(result?.sessionIds).toEqual(['ses_multirun']);
-    expect(upsertedSessions.map((session) => session.id)).toEqual(['ses_multirun']);
-    expect(registeredDirectories).toEqual([{ sessionID: 'ses_multirun', directory: '/repo' }]);
+    expect(result?.sessionIds).toEqual([createdSessionIds[0]]);
+    expect(upsertedSessions.map((session) => session.id)).toEqual([createdSessionIds[0]]);
+    expect(registeredDirectories).toEqual([{ sessionID: createdSessionIds[0], directory: '/repo' }]);
     expect(ensureChildCalls).toEqual([{ directory: '/repo', bootstrap: false }]);
-    expect(childState.session.map((session) => session.id)).toEqual(['ses_multirun']);
+    expect(childState.session.map((session) => session.id)).toEqual([createdSessionIds[0]]);
+  });
+
+  test('membership failure does not dispatch that session or discard a successful sibling', async () => {
+    rejectNextMembership = true;
+    const result = await useMultiRunStore.getState().createMultiRun({
+      name: 'same name', isolateRuns: false,
+      groups: [{ prompt: 'question', models: [
+        { providerID: 'openrouter', modelID: 'vendor/fail' },
+        { providerID: 'openrouter', modelID: 'vendor/success' },
+      ] }],
+    });
+    await Promise.resolve();
+    expect(result?.sessionIds).toEqual([createdSessionIds[1]]);
+    expect(result?.failedCount).toBe(1);
+    expect(deletedSessionIds).toEqual([createdSessionIds[0]]);
+    expect(dispatchedSessionIds).toEqual([createdSessionIds[1]]);
+    expect(upsertedSessions.map((session) => session.id)).toEqual([createdSessionIds[1]]);
+  });
+
+  test('changing runtime while creating stops dispatch and registration', async () => {
+    onCreate = () => {
+      activeClient = {};
+      useMultiRunStore.getState().resetForRuntimeSwitch();
+    };
+    const result = await useMultiRunStore.getState().createMultiRun({
+      name: 'runtime', isolateRuns: false,
+      groups: [{ prompt: 'question', models: [{ providerID: 'openrouter', modelID: 'vendor/model' }] }],
+    });
+    expect(result).toBeNull();
+    expect(dispatchedSessionIds).toEqual([]);
+    expect(upsertedSessions).toEqual([]);
+    expect(deletedSessionIds).toEqual([]);
+    expect(useMultiRunStore.getState().isLoading).toBe(false);
   });
 
   test('uses fast background worktree creation for isolated runs', async () => {
@@ -195,15 +242,15 @@ describe('useMultiRunStore', () => {
       }],
     });
 
-    expect(result?.sessionIds).toEqual(['ses_multirun']);
+    expect(result?.sessionIds).toEqual([createdSessionIds[0]]);
     expect(worktreeCreateCalls.length).toBe(1);
     expect(worktreeCreateCalls[0]?.project).toEqual({ id: 'project-1', path: '/repo' });
     expect(worktreeCreateCalls[0]?.args.returnAfterDirectoryCreated).toBe(true);
     expect(worktreeCreateCalls[0]?.options).toEqual({ resolvedRootTrackingRemote: null });
     expect(worktreeBootstrapWaitCalls).toEqual([]);
     expect(operationOrder).toEqual(['createSession:/repo-worktrees/fix-thing']);
-    expect(registeredDirectories).toEqual([{ sessionID: 'ses_multirun', directory: '/repo-worktrees/fix-thing' }]);
-    expect(worktreeMetadataCalls).toEqual([{ sessionId: 'ses_multirun', path: '/repo-worktrees/fix-thing' }]);
+    expect(registeredDirectories).toEqual([{ sessionID: createdSessionIds[0], directory: '/repo-worktrees/fix-thing' }]);
+    expect(worktreeMetadataCalls).toEqual([{ sessionId: createdSessionIds[0], path: '/repo-worktrees/fix-thing' }]);
   });
 
   test('waits for isolated worktree bootstrap when setup wait is enabled', async () => {
@@ -219,7 +266,7 @@ describe('useMultiRunStore', () => {
       }],
     });
 
-    expect(result?.sessionIds).toEqual(['ses_multirun']);
+    expect(result?.sessionIds).toEqual([createdSessionIds[0]]);
     expect(worktreeBootstrapWaitCalls).toEqual(['/repo-worktrees/fix-thing']);
     expect(operationOrder).toEqual([
       'wait:/repo-worktrees/fix-thing',

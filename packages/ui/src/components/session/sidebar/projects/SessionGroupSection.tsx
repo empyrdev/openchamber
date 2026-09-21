@@ -103,6 +103,7 @@ export type SessionGroupSectionProps = {
   | 'setDeleteSessionConfirm'
   | 'startFolderRename'
   | 'startSessionWorktreeMenuLoad'
+  | 'onEditProject'
 >;
 
 const CollapsedFolderActivity: React.FC<{

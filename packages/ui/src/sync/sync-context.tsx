@@ -68,7 +68,7 @@ import {
 } from "./vscode-permission-auto-accept"
 import { useConfigStore } from "@/stores/useConfigStore"
 import { refreshStoresForCatalogKind } from "@/stores/catalogRefresh"
-import { useGlobalSessionsStore } from "@/stores/useGlobalSessionsStore"
+import { resolveGlobalSessionDirectory, useGlobalSessionsStore } from "@/stores/useGlobalSessionsStore"
 import { cleanupPersistedSessionState } from "./session-deletion-cleanup"
 import { toast } from "@/components/ui"
 import { appendNotification } from "./notification-store"
@@ -80,6 +80,7 @@ import {
   getDirectoryOwnedSessionIds,
   useGlobalSessionStatusStore,
 } from "./global-session-status"
+import { applyGlobalBlockingRequestEvents } from "./global-blocking-requests"
 import type { State } from "./types"
 import {
   getSessionMaterializationRequestKey,
@@ -242,6 +243,7 @@ const publishDirectoryEventBatch = (batch: DirectoryEventBatch): void => {
   applySessionEventsToGlobalSessions(batch.globalSessionEvents)
   for (const [directory, events] of batch.globalStatusEventsByDirectory) {
     applyGlobalSessionStatusEvents(directory, events)
+    applyGlobalBlockingRequestEvents(directory, events)
   }
   for (const store of batch.changedStores) {
     const state = batch.states.get(store)
@@ -512,6 +514,56 @@ const getFormToastKey = (sessionID?: string, requestID?: string) => {
 /** A pending form has no question text on the wire — only the form's title. */
 const FORM_TOAST_DESCRIPTION = "Agent is waiting for your input"
 
+const recordTurnOutcomeNotification = (
+  payload: Extract<SyncEvent, { type: "session.idle" | "session.error" }>,
+  directory: string,
+  childStores: ChildStoreManager,
+  batch?: DirectoryEventBatch,
+): void => {
+  const sessionID = payload.properties.sessionID
+  const store = childStores.getChild(directory)
+  const session = store ? getDirectoryEventState(store, batch).session.find((item) => item.id === sessionID) : undefined
+  const cachedSession = useGlobalSessionsStore.getState().entityById.get(sessionID)
+  if (session?.parentID || cachedSession?.parentID) return
+  const errorSummary = payload.type === "session.error" ? summarizeOpenCodeError(payload.properties.error) : null
+  if (errorSummary) recordSessionError({ sessionId: sessionID, directory, ...errorSummary })
+  appendNotification({
+    directory,
+    session: sessionID,
+    time: Date.now(),
+    viewed: isViewedInCurrentSession(directory, sessionID),
+    ...(errorSummary ? { type: "error" as const, error: errorSummary } : { type: "turn-complete" as const }),
+  })
+}
+
+const notifyPermissionAsked = (permission: PermissionRequest, directory: string): void => {
+  showPermissionNeededToast({
+    permission,
+    directory,
+    isViewed: isViewedInCurrentSession(directory, permission.sessionID),
+    pendingIds: pendingPermissionToastIds,
+    show: (title, options) => toast.info(title, options),
+    openSession: openSessionFromToast,
+  })
+}
+
+const notifyBlockingRequestWithoutStore = (payload: SyncEvent, directory: string): void => {
+  if (payload.type === "permission.asked") {
+    notifyPermissionAsked(payload.properties, directory)
+    return
+  }
+  if (payload.type !== "form.created") return
+  const { form } = payload.properties
+  const toastKey = getFormToastKey(form.sessionID, form.id)
+  if (!toastKey || pendingFormToastIds.has(toastKey) || isViewedInCurrentSession(directory, form.sessionID)) return
+  pendingFormToastIds.add(toastKey)
+  toast.info(form.title, {
+    id: `form-${toastKey}`,
+    description: FORM_TOAST_DESCRIPTION,
+    action: { label: "Open session", onClick: () => openSessionFromToast(form.sessionID, directory) },
+  })
+}
+
 /** Blank server strings mean "absent" here, not "empty title". */
 const trimmedOrUndefined = (value: string | undefined): string | undefined => {
   const trimmed = value?.trim()
@@ -573,8 +625,11 @@ const handleUiNotificationEvent = (notification: OpenchamberNotification, fallba
 }
 
 export function setActiveSession(directory: string, sessionId: string) {
+  const previousDirectory = _activeDirectory
   _activeDirectory = directory
   _activeSession = sessionId
+  getImperativeSessionMessageLoader()?.scheduleCacheRetention(previousDirectory)
+  getImperativeSessionMessageLoader()?.touchSessionCache({ directory, sessionID: sessionId })
 }
 
 export function setExternallyViewedSession(directory: string, sessionId: string, viewed: boolean) {
@@ -582,6 +637,7 @@ export function setExternallyViewedSession(directory: string, sessionId: string,
   const key = viewedSessionKey(directory, sessionId)
   if (!viewed) {
     externallyViewedSessions.delete(key)
+    getImperativeSessionMessageLoader()?.scheduleCacheRetention(directory)
     return
   }
   externallyViewedSessions.set(key, Date.now() + EXTERNAL_VIEW_TTL_MS)
@@ -1039,6 +1095,11 @@ const getActiveDirectoryFallback = (
   return childStores.getChild(_activeDirectory) ? _activeDirectory : null
 }
 
+const resolveCachedSessionDirectory = (sessionID: string): string | null => {
+  const session = useGlobalSessionsStore.getState().entityById.get(sessionID)
+  return session ? resolveGlobalSessionDirectory(session) : null
+}
+
 const resolveDirectoryFromRoutingIndex = (
   routingIndex: EventRoutingIndex,
   rawDirectory: string,
@@ -1065,6 +1126,15 @@ const resolveDirectoryFromRoutingIndex = (
     const found = findSessionInChildStores(sessionID, childStores, routingIndex, batch)
     if (found) {
       return found
+    }
+
+    // Unopened directories have no store, so a session the global cache lists
+    // for one of them is routed to that recorded directory. Without this, the
+    // active-session and single-store fallbacks below would file another
+    // project's events into whichever directory happens to be open.
+    const cachedDirectory = resolveCachedSessionDirectory(sessionID)
+    if (cachedDirectory) {
+      return cachedDirectory
     }
 
     // The global stream does not always include a directory. During a session
@@ -1528,10 +1598,18 @@ export function handleEvent(
       else batch.globalStatusEventsByDirectory.set(directory, [payload])
     } else {
       applySessionEventToGlobalSessions(payload)
-      // Child stores remain the primary source for synced directories; this
-      // index covers unopened directories and list/status races.
+      // Child stores remain the primary source for synced directories; these
+      // indexes cover unopened directories and list/status races.
       applyGlobalSessionStatusEvent(directory, payload)
+      applyGlobalBlockingRequestEvents(directory, [payload])
     }
+  }
+
+  // Turn-complete and error notifications are recorded before the directory
+  // store lookup. Unopened directories are never bootstrapped and have no
+  // store, yet their collapsed sidebar rows still need the unread dot.
+  if ((payload.type === "session.idle" || payload.type === "session.error") && directory && directory !== "global") {
+    recordTurnOutcomeNotification(payload, directory, childStores, batch)
   }
 
   // Global events
@@ -1586,6 +1664,7 @@ export function handleEvent(
   }
 
   if (!store) {
+    notifyBlockingRequestWithoutStore(payload, directory)
     // Try as global event for unknown directories
     const result = reduceGlobalEvent(payload)
     if (result?.type === "refresh") {
@@ -1632,15 +1711,7 @@ export function handleEvent(
       return
     }
 
-    const isViewed = isViewedInCurrentSession(resolvedDirectory, permission.sessionID)
-    showPermissionNeededToast({
-      permission,
-      directory: resolvedDirectory,
-      isViewed,
-      pendingIds: pendingPermissionToastIds,
-      show: (title, options) => toast.info(title, options),
-      openSession: openSessionFromToast,
-    })
+    notifyPermissionAsked(permission, resolvedDirectory)
   }
 
   if (payload.type === "permission.replied") {
@@ -1680,32 +1751,6 @@ export function handleEvent(
     if (toastKey) {
       pendingFormToastIds.delete(toastKey)
       toast.dismiss(`form-${toastKey}`)
-    }
-  }
-
-  // Notification dispatch for session turn-complete and error events.
-  // These are NOT handled by the event reducer — only the notification store.
-  if (payload.type === "session.idle" || payload.type === "session.error") {
-    const { sessionID } = payload.properties
-    const errorSummary = payload.type === "session.error" ? summarizeOpenCodeError(payload.properties.error) : null
-    if (errorSummary && sessionID) {
-      recordSessionError({ sessionId: sessionID, directory: resolvedDirectory ?? null, ...errorSummary })
-    }
-    // Skip subtask sessions — only top-level sessions generate notifications
-    const storeState = getDirectoryEventState(store, batch)
-    const session = storeState.session.find((s) => s.id === sessionID)
-    if (session?.parentID) {
-      // subtask — skip notification
-    } else if (sessionID) {
-      appendNotification({
-        directory: resolvedDirectory,
-        session: sessionID,
-        time: Date.now(),
-        viewed: isViewedInCurrentSession(resolvedDirectory, sessionID),
-        ...(errorSummary
-          ? { type: "error" as const, error: errorSummary }
-          : { type: "turn-complete" as const }),
-      })
     }
   }
 
@@ -2623,6 +2668,21 @@ export function SyncProvider(props: {
   }, [props.directory, childStores, routingIndex])
 
   // Set refs so non-React code (session-actions, session-ui-store) can access sync state
+  useEffect(() => messageLoader.startCacheRetention({
+    isCurrent: () => getRuntimeKey() === runtimeKey,
+    isViewed: ({ directory, sessionID }) => (
+      directory === _activeDirectory && sessionID === _activeSession
+    ) || (externallyViewedSessions.get(viewedSessionKey(directory, sessionID)) ?? 0) > Date.now(),
+    isActive: ({ directory, sessionID }) => {
+      const live = useGlobalSessionStatusStore.getState().statusById.get(sessionID)
+      return live?.directory === directory && live.status.type !== "idle"
+    },
+    releaseDerivedCache: ({ directory, sessionID }) => {
+      const store = childStores.getChild(directory)
+      if (store) dropCachedSessionMessageRecordsSnapshots(store, [sessionID])
+    },
+  }), [childStores, messageLoader, runtimeKey])
+
   useEffect(() => {
     setImperativeSessionMessageLoader(messageLoader)
     setSyncRefs(props.sdk, childStores, props.directory, (sessionID, dir) => {
@@ -3133,7 +3193,7 @@ const rememberSessionMessageRecordsSnapshot = (
   }
 }
 
-export function dropCachedSessionMessageRecordsSnapshots(
+function dropCachedSessionMessageRecordsSnapshots(
   store: StoreApi<DirectoryStore>,
   sessionIDs: Iterable<string>,
 ): void {

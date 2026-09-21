@@ -92,7 +92,7 @@ export type CatalogKind =
   | "credential"
   | "project"
 
-export type SyncEvent =
+export type SyncEvent = (
   | { type: "server.connected"; properties: Record<never, never> }
   | { type: "installation.update-available"; properties: { version: string } }
   | { type: "session.created"; properties: { info: Session } }
@@ -117,7 +117,7 @@ export type SyncEvent =
   | { type: "catalog.updated"; properties: { kind: CatalogKind } }
   // OpenChamber's own server frames that ride the same stream.
   | { type: "openchamber.notification"; properties: OpenchamberNotification }
-  | { type: "openchamber.permission-auto-accept"; properties: { sessions: Record<string, boolean>; revision?: number } }
+  | { type: "openchamber.permission-auto-accept"; properties: { sessions: Record<string, boolean>; revision?: number } }) & { id?: string }
 
 /** Agent-completion / restart notices the OpenChamber server publishes for non-web runtimes. */
 export type OpenchamberNotification = {
