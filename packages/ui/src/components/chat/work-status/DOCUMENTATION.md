@@ -100,7 +100,7 @@ which requests only providers enabled for this panel.
 | Branch, ahead/behind, attention | `useGitStore` directory state | warmed via `runBackgroundNetworkTask(ensureStatus)` and refreshed from Git mutation hints |
 | Changed files | `useGitStore` status `files` + `diffStats` | working tree, not session-authored edits |
 | PR + checks | `useFreshestPrVisualSummaryForBranch` | **read-only**; follows the freshest remote-keyed entry for the branch |
-| Subagents | child sessions from `useAllLiveSessions` (`parentID`) + `useAllSessionStatuses`; per-row cost from `useSubagentCostRollup`'s `perChildCost` (each child's own subtree total, so nested subagent-of-subagent cost rolls up under its immediate parent row) | |
+| Subagents | child sessions from `useAllLiveSessions` (`parentID`), global live status per child via `useGlobalSessionStatus`, and directory statuses as a local fallback; per-row cost from `useSubagentCostRollup`'s `perChildCost` (each child's own subtree total, so nested subagent-of-subagent cost rolls up under its immediate parent row) | Global busy and retry state is authoritative for discovered, TUI-originated, and reconnecting children; local status preserves activity for an already-open directory. |
 | Subagent blockers | directory `permission` / `question` maps | one subscription covers every child |
 | Usage | `components/usage/usageGroups.ts` over `useQuotaStore` | grouping shared with the mobile popover; presentation is not |
 | Linked threads | `lib/linkedIssues.ts` over session metadata | written by the flows that attach an issue or PR |

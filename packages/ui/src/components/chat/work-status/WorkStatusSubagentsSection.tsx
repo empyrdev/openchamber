@@ -1,6 +1,7 @@
 import React from 'react';
 import { useI18n } from '@/lib/i18n';
-import { useAllLiveSessions, useAllSessionStatuses, useDirectorySync } from '@/sync/sync-context';
+import { useAllLiveSessions, useAllSessionStatuses, useDirectorySync, useGlobalSessionStatus } from '@/sync/sync-context';
+import { useGlobalSessionStatusStore } from '@/sync/global-session-status';
 import { useUIStore } from '@/stores/useUIStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { isVSCodeRuntime } from '@/lib/desktop';
@@ -10,6 +11,7 @@ import { useReportWorkStatusPresence } from './presenceContext';
 import { formatCost } from './subagentCost';
 import { useSubagentCostRollup } from './useSubagentCostRollup';
 import type { State } from '@/sync/types';
+import type { Session, SessionStatus } from '@/lib/opencode/model';
 
 type Props = {
   sessionId: string | null;
@@ -17,6 +19,56 @@ type Props = {
 };
 
 const SECTION_ID = 'subagents';
+
+const isActiveStatus = (status: SessionStatus | undefined): boolean => (
+  status?.type === 'busy' || status?.type === 'retry'
+);
+
+type SubagentRowProps = {
+  child: Session;
+  localStatus: SessionStatus | undefined;
+  blocked: boolean;
+  asked: boolean;
+  childCost: number;
+  directory: string | null;
+  openChildSession: (childId: string, label: string) => void;
+};
+
+const WorkStatusSubagentRow: React.FC<SubagentRowProps> = ({
+  child,
+  localStatus,
+  blocked,
+  asked,
+  childCost,
+  directory,
+  openChildSession,
+}) => {
+  const { t } = useI18n();
+  const globalStatus = useGlobalSessionStatus(child.id);
+  const active = isActiveStatus(globalStatus) || isActiveStatus(localStatus);
+  const label = child.title?.trim() || t('chat.workStatus.subagent.untitled');
+  return (
+    <WorkStatusRow
+      onClick={directory ? () => openChildSession(child.id, label) : undefined}
+      ariaLabel={t('chat.workStatus.action.openSubagent', { name: label })}
+      label={label}
+      value={(
+        <>
+          {blocked ? (
+            <WorkStatusValue tone="warning">{t('chat.workStatus.subagent.needsPermission')}</WorkStatusValue>
+          ) : asked ? (
+            <WorkStatusValue tone="warning">{t('chat.workStatus.subagent.askedQuestion')}</WorkStatusValue>
+          ) : active ? (
+            <WorkStatusValue tone="info">{t('chat.workStatus.subagent.working')}</WorkStatusValue>
+          ) : (
+            <WorkStatusValue tone="muted">{t('chat.workStatus.subagent.done')}</WorkStatusValue>
+          )}
+          {childCost > 0 ? <WorkStatusValue tone="muted">{formatCost(childCost)}</WorkStatusValue> : null}
+        </>
+      )}
+    />
+  );
+};
 
 /**
  * Running subagents and, more importantly, their blockers: a permission request
@@ -33,6 +85,16 @@ export const WorkStatusSubagentsSection: React.FC<Props> = ({ sessionId, directo
     () => (sessionId ? liveSessions.filter((candidate) => candidate.parentID === sessionId) : []),
     [liveSessions, sessionId],
   );
+  const locallyActiveChildIds = React.useMemo(() => new Set(
+    children.filter((child) => isActiveStatus(statuses[child.id])).map((child) => child.id),
+  ), [children, statuses]);
+  const globallyActiveChildCount = useGlobalSessionStatusStore(React.useCallback((state) => {
+    let count = 0;
+    for (const child of children) {
+      if (!locallyActiveChildIds.has(child.id) && state.activeSessionIds.has(child.id)) count += 1;
+    }
+    return count;
+  }, [children, locallyActiveChildIds]));
 
   // Each child's own subtree total (its cost plus every descendant of its
   // own), so nested subagent-of-subagent cost rolls up under the immediate
@@ -79,7 +141,7 @@ export const WorkStatusSubagentsSection: React.FC<Props> = ({ sessionId, directo
 
   if (children.length === 0) return null;
 
-  const busyChildren = children.filter((child) => statuses[child.id]?.type === 'busy').length;
+  const activeChildren = locallyActiveChildIds.size + globallyActiveChildCount;
 
   return (
     <WorkStatusCollapsibleSection
@@ -87,38 +149,21 @@ export const WorkStatusSubagentsSection: React.FC<Props> = ({ sessionId, directo
       title={t('chat.workStatus.section.subagents')}
       icon="ai-agent"
       defaultExpanded
-      summary={busyChildren > 0 ? `${busyChildren}/${children.length}` : children.length}
+      summary={activeChildren > 0 ? `${activeChildren}/${children.length}` : children.length}
     >
       <div className="max-h-56 overflow-y-auto">
-        {children.map((child) => {
-          const blocked = (permissions[child.id]?.length ?? 0) > 0;
-          const asked = (forms[child.id]?.length ?? 0) > 0;
-          const busy = statuses[child.id]?.type === 'busy';
-          const label = child.title?.trim() || t('chat.workStatus.subagent.untitled');
-          const childCost = perChildCost.get(child.id) ?? 0;
-          return (
-            <WorkStatusRow
-              key={child.id}
-              onClick={directory ? () => openChildSession(child.id, label) : undefined}
-              ariaLabel={t('chat.workStatus.action.openSubagent', { name: label })}
-              label={label}
-              value={(
-                <>
-                  {blocked ? (
-                    <WorkStatusValue tone="warning">{t('chat.workStatus.subagent.needsPermission')}</WorkStatusValue>
-                  ) : asked ? (
-                    <WorkStatusValue tone="warning">{t('chat.workStatus.subagent.askedQuestion')}</WorkStatusValue>
-                  ) : busy ? (
-                    <WorkStatusValue tone="info">{t('chat.workStatus.subagent.working')}</WorkStatusValue>
-                  ) : (
-                    <WorkStatusValue tone="muted">{t('chat.workStatus.subagent.done')}</WorkStatusValue>
-                  )}
-                  {childCost > 0 ? <WorkStatusValue tone="muted">{formatCost(childCost)}</WorkStatusValue> : null}
-                </>
-              )}
-            />
-          );
-        })}
+        {children.map((child) => (
+          <WorkStatusSubagentRow
+            key={child.id}
+            child={child}
+            localStatus={statuses[child.id]}
+            blocked={(permissions[child.id]?.length ?? 0) > 0}
+            asked={(forms[child.id]?.length ?? 0) > 0}
+            childCost={perChildCost.get(child.id) ?? 0}
+            directory={directory}
+            openChildSession={openChildSession}
+          />
+        ))}
       </div>
     </WorkStatusCollapsibleSection>
   );
