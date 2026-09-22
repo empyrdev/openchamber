@@ -6,9 +6,11 @@ import {
   claimAutoReviewForward,
   releaseAutoReviewForward,
   hasFinalReviewMarker,
+  inheritPermissionAutoAccept,
   isAutoReviewRuntimeCurrent,
   stripFinalReviewMarker,
 } from './reviewFlow';
+import { usePermissionStore } from '@/stores/permissionStore';
 import type { AutoReviewRun } from '@/stores/useAutoReviewStore';
 
 describe('reviewFlow auto-review helpers', () => {
@@ -59,12 +61,31 @@ describe('reviewFlow auto-review helpers', () => {
 
     const key = claimAutoReviewForward(run, 'msg_assistant_review');
 
-    expect(typeof key).toBe('string');
+    if (key === null) throw new Error('Expected the first forward claim to succeed');
     expect(claimAutoReviewForward(run, 'msg_assistant_review')).toBeNull();
 
-    releaseAutoReviewForward(key!);
+    releaseAutoReviewForward(key);
     const nextKey = claimAutoReviewForward(run, 'msg_assistant_review');
     expect(nextKey).toBe(key);
-    releaseAutoReviewForward(nextKey!);
+    if (nextKey === null) throw new Error('Expected the released forward claim to succeed');
+    releaseAutoReviewForward(nextKey);
+  });
+
+  test('inherits permission auto-accept when creating a review session', async () => {
+    const store = usePermissionStore.getState();
+    const isSessionAutoAccepting = store.isSessionAutoAccepting;
+    const setSessionAutoAccept = store.setSessionAutoAccept;
+    const inherited: Array<[string, boolean]> = [];
+    usePermissionStore.setState({
+      isSessionAutoAccepting: (sessionID) => sessionID === 'original-1',
+      setSessionAutoAccept: async (sessionID, enabled) => { inherited.push([sessionID, enabled]); },
+    });
+
+    try {
+      await inheritPermissionAutoAccept('original-1', 'review-1');
+      expect(inherited).toEqual([['review-1', true]]);
+    } finally {
+      usePermissionStore.setState({ isSessionAutoAccepting, setSessionAutoAccept });
+    }
   });
 });

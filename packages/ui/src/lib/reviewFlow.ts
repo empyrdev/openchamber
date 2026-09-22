@@ -14,6 +14,7 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { useAutoReviewStore, type AutoReviewRun } from '@/stores/useAutoReviewStore';
 import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { useUIStore } from '@/stores/useUIStore';
+import { usePermissionStore } from '@/stores/permissionStore';
 import { optimisticSend, patchSessionMetadata, waitForConnectionOrThrow } from '@/sync/session-actions';
 import { useSelectionStore } from '@/sync/selection-store';
 import { resolveSendSelection, useSessionUIStore } from '@/sync/session-ui-store';
@@ -52,21 +53,12 @@ type AssistantTextMessage = {
 };
 
 const isMessageCompleted = (message: Message): boolean => {
-  const finish = (message as { finish?: unknown }).finish;
-  if (typeof finish === 'string' && finish.length > 0) return true;
-  const completed = (message as { time?: { completed?: unknown } }).time?.completed;
-  return typeof completed === 'number' && completed > 0;
+  return message.role === 'assistant' && (message.finish !== undefined || message.time.completed !== undefined);
 };
 
-const getMessageCreatedAt = (message: Message): number => {
-  const created = (message as { time?: { created?: unknown } }).time?.created;
-  return typeof created === 'number' && Number.isFinite(created) ? created : 0;
-};
+const getMessageCreatedAt = (message: Message): number => message.time.created;
 
-const getMessageRole = (message: Message): string => {
-  const role = (message as { role?: unknown }).role;
-  return typeof role === 'string' ? role : '';
-};
+const getMessageRole = (message: Message): Message['role'] => message.role;
 
 // OpenCode v2 messages carry no `parentID`, so a reply can no longer be tied to
 // the prompt that caused it. The wait loop identifies the handoff by ordering
@@ -74,13 +66,7 @@ const getMessageRole = (message: Message): string => {
 // sent, skipping anything already forwarded.
 const isCompactionCommandMessage = (message: Message, directory: string): boolean => {
   const parts = getSyncParts(message.id, directory);
-  return parts.some((part) => {
-    const type = (part as { type?: unknown }).type;
-    if (type === 'compaction') return true;
-    if (type !== 'text') return false;
-    const text = (part as { text?: unknown }).text;
-    return typeof text === 'string' && text.trim() === '/compact';
-  });
+  return parts.some((part) => part.type === 'text' && part.text.trim() === '/compact');
 };
 
 const getLatestAssistantTextMessage = (
@@ -127,10 +113,7 @@ export const assertAutoReviewRuntimeStillCurrent = (expectedRuntimeKey?: string)
   }
 };
 
-const isRuntimeChangeError = (error: unknown): boolean => {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.includes('runtime changed');
-};
+const isRuntimeChangeError = (error: Error): boolean => error.message.includes('runtime changed');
 
 export const hasFinalReviewMarker = (text: string): boolean => {
   const lines = text.trim().split('\n').map((line) => line.trim()).filter(Boolean);
@@ -272,7 +255,7 @@ export const resumeAutoReviewRun = (originalSessionID: string): void => {
     console.error('[review-flow] auto-review loop failed', error);
     useAutoReviewStore.getState().updateRun(run.originalSessionID, (current) => ({
       ...current,
-      status: isRuntimeChangeError(error) ? 'stopped' : 'error',
+      status: error instanceof Error && isRuntimeChangeError(error) ? 'stopped' : 'error',
       error: error instanceof Error ? error.message : String(error),
     }));
   }).finally(() => {
@@ -389,8 +372,8 @@ const sendPlainMessage = async (
 };
 
 const requestChatForceScrollBottom = (sessionId: string): void => {
-  if (typeof window === 'undefined') return;
-  window.dispatchEvent(new CustomEvent('openchamber:chat-force-scroll-bottom', {
+  if (!globalThis.window) return;
+  globalThis.window.dispatchEvent(new CustomEvent('openchamber:chat-force-scroll-bottom', {
     detail: { sessionId },
   }));
 };
@@ -417,6 +400,19 @@ const getReviewSessionTitle = (original: Session): string => {
   return `Review: ${implementationTitle}`;
 };
 
+// A review session runs tools too (reads other directories, verifies with commands),
+// so a fresh one starts with the same auto-accept choice as the session it reviews.
+// Failure only leaves the reviewer prompting for permissions the way it did before.
+export const inheritPermissionAutoAccept = async (originalSessionID: string, reviewSessionID: string): Promise<void> => {
+  const permissions = usePermissionStore.getState();
+  if (!permissions.isSessionAutoAccepting(originalSessionID)) return;
+  try {
+    await permissions.setSessionAutoAccept(reviewSessionID, true);
+  } catch (error) {
+    console.warn('[review-flow] failed to inherit permission auto-accept for review session', error);
+  }
+};
+
 const createOrReuseReviewSession = async (
   originalSessionID: string,
   directory: string,
@@ -431,16 +427,7 @@ const createOrReuseReviewSession = async (
     const existing = await getSessionOrNull(existingReviewID, directory);
     assertAutoReviewRuntimeStillCurrent(expectedRuntimeKey);
     if (existing && isReviewSession(existing)) return existing;
-    await patchSessionMetadata(originalSessionID, directory, (metadata) => {
-      const next = { ...metadata };
-      const openchamber = next.openchamber;
-      if (openchamber && typeof openchamber === 'object' && !Array.isArray(openchamber)) {
-        const rest = { ...openchamber };
-        delete rest.reviewSessionID;
-        next.openchamber = rest;
-      }
-      return next;
-    });
+    await patchSessionMetadata(originalSessionID, directory, (metadata) => withoutReviewSessionLink(metadata, existingReviewID));
   }
 
   assertAutoReviewRuntimeStillCurrent(expectedRuntimeKey);
@@ -465,6 +452,7 @@ const createOrReuseReviewSession = async (
     throw error;
   }
   useGlobalSessionsStore.getState().upsertSession(review);
+  await inheritPermissionAutoAccept(originalSessionID, review.id);
   return review;
 };
 
