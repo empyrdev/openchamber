@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { ConfigModelSettings, Model, Provider, ProviderCompaction } from "./model"
 
-describe("OpenCode 2.0.12 model settings", () => {
+describe("OpenCode model settings", () => {
   test("keeps model overlays in settings and accepts both compaction variants", () => {
     const summary = { type: "summary" } satisfies ProviderCompaction
     const native = { type: "native" } satisfies ProviderCompaction
