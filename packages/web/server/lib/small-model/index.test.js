@@ -64,7 +64,7 @@ beforeAll(async () => {
     if (url.pathname === '/api/model') return send({ location: LOCATION, data: state.models });
     if (url.pathname === '/api/model/default') return send({ location: LOCATION, data: state.defaultModel });
     if (url.pathname === '/api/provider') return send({ location: LOCATION, data: state.providers });
-    if (url.pathname === '/api/generate') {
+    if (url.pathname === '/api/experimental/generate') {
       const error = state.generateErrors.shift();
       if (error) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -97,7 +97,7 @@ beforeEach(() => {
   resetOpenCodeRuntimeProviders();
 });
 
-const lastGenerate = () => state.requests.filter((entry) => entry.path === '/api/generate').at(-1);
+const lastGenerate = () => state.requests.filter((entry) => entry.path === '/api/experimental/generate').at(-1);
 
 describe('generateSmallModelText', () => {
   const unavailable = { _tag: 'InvalidRequestError', message: 'Model unavailable: zai-coding-plan/glm-5.3-flash' };
@@ -107,7 +107,7 @@ describe('generateSmallModelText', () => {
     state.generateErrors = [unavailable];
     const result = await generateSmallModelText(options);
     expect(result.text).toBe('generated');
-    const calls = state.requests.filter((entry) => entry.path === '/api/generate');
+    const calls = state.requests.filter((entry) => entry.path === '/api/experimental/generate');
     expect(calls).toHaveLength(2);
     expect(calls[0].body).toEqual(calls[1].body);
   });
@@ -117,19 +117,19 @@ describe('generateSmallModelText', () => {
     await expect(generateSmallModelText(options)).rejects.toMatchObject({
       message: unavailable.message, statusCode: 503, code: 'small-model-unavailable',
     });
-    expect(state.requests.filter((entry) => entry.path === '/api/generate')).toHaveLength(2);
+    expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(2);
   });
 
   it('does not retry other invalid requests', async () => {
     state.generateErrors = [{ _tag: 'InvalidRequestError', message: 'Invalid prompt' }];
     await expect(generateSmallModelText(options)).rejects.toMatchObject({ message: 'Invalid prompt' });
-    expect(state.requests.filter((entry) => entry.path === '/api/generate')).toHaveLength(1);
+    expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(1);
   });
 
   it('does not retry provider failures with the same message', async () => {
     state.generateErrors = [{ _tag: 'ServiceUnavailableError', message: unavailable.message }];
     await expect(generateSmallModelText(options)).rejects.toMatchObject({ _tag: 'ServiceUnavailableError' });
-    expect(state.requests.filter((entry) => entry.path === '/api/generate')).toHaveLength(1);
+    expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(1);
   });
 
   it('cancels without sending the retry', async () => {
@@ -139,7 +139,7 @@ describe('generateSmallModelText', () => {
     const timer = setTimeout(() => controller.abort(), 100);
     try {
       await expect(pending).rejects.toThrow();
-      expect(state.requests.filter((entry) => entry.path === '/api/generate')).toHaveLength(1);
+      expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(1);
     } finally {
       clearTimeout(timer);
     }
@@ -148,10 +148,10 @@ describe('generateSmallModelText', () => {
   it('honors the timeout during the retry delay', async () => {
     state.generateErrors = [unavailable];
     await expect(generateSmallModelText({ ...options, timeoutMs: 100 })).rejects.toThrow();
-    expect(state.requests.filter((entry) => entry.path === '/api/generate')).toHaveLength(1);
+    expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(1);
   });
 
-  it('sends the prompt to /api/generate on the resolved model', async () => {
+  it('sends the prompt to /api/experimental/generate on the resolved model', async () => {
     const result = await generateSmallModelText({ prompt: 'summarize this', directory: '/proj' });
 
     // The fixture's only model is a haiku: the family scan finds it before
@@ -404,7 +404,7 @@ describe('structured output', () => {
     await expect(generateSmallModelText({ prompt: 'describe', directory: '/proj', responseSchema: schema }))
       .rejects.toMatchObject({ statusCode: 422, code: 'structured-output-unsupported' });
 
-    expect(state.requests.filter((entry) => entry.path === '/api/generate')).toHaveLength(2);
+    expect(state.requests.filter((entry) => entry.path === '/api/experimental/generate')).toHaveLength(2);
   });
 });
 
@@ -421,7 +421,7 @@ describe('describeSmallModel', () => {
       contextKnown: true,
       hasLogin: true,
       outputTokenLimit: 4_000,
-      // /api/generate has no structured-output mode, so the capability is
+      // /api/experimental/generate has no structured-output mode, so the capability is
       // never a settled `false` — callers must try it.
       structuredOutput: null,
     });

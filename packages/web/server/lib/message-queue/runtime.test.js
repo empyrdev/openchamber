@@ -242,7 +242,7 @@ describe('message queue runtime', () => {
     emit({ type: 'session.status', properties: { sessionID: SESSION, status: { type: 'idle' } } });
     await settle();
     expect(openCode.state.sent).toHaveLength(1);
-    expect(openCode.state.sent[0].path).toBe(`/session/${SESSION}/prompt_async`);
+    expect(openCode.state.sent[0].path).toBe(`/api/session/${SESSION}/prompt`);
   });
 
   it('treats an unreachable OpenCode as unknown, not idle', async () => {

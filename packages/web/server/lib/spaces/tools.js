@@ -57,7 +57,7 @@ const openCodePackages = (version) => ({ 'opencode-ai': version, '@opencode-ai/p
 
 /**
  * The versions a released host installs: its own `@openchamber/web`, and OpenCode at the
- * version of the `@opencode-ai/sdk` this server was built against.
+ * version of the `@opencode/client` this server was built against.
  */
 export function readHostToolVersions(packageJsonUrl = new URL('../../../package.json', import.meta.url)) {
   let manifest;
@@ -68,7 +68,7 @@ export function readHostToolVersions(packageJsonUrl = new URL('../../../package.
   }
   return {
     webVersion: requireVersion(manifest.version, '@openchamber/web'),
-    openCodeVersion: requireVersion(manifest.dependencies?.['@opencode-ai/sdk'], 'OpenCode'),
+    openCodeVersion: requireVersion(manifest.dependencies?.['@opencode/client'], 'OpenCode'),
   };
 }
 

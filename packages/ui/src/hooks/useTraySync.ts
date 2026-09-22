@@ -1,12 +1,10 @@
 import React from 'react';
-import type { Session, SessionStatus } from '@/lib/opencode/model';
+import type { Session } from '@/lib/opencode/model';
 import { canUseElectronDesktopIPC, invokeDesktop, isDesktopLocalOriginActive } from '@/lib/desktop';
 import { getRuntimeApiBaseUrl } from '@/lib/runtime-switch';
 import { desktopHostsGet, getDesktopHostApiUrl, locationMatchesHost, redactSensitiveUrl } from '@/lib/desktopHosts';
 import { getSyncChildStores } from '@/sync/sync-refs';
 import { useGlobalSessionStatusStore } from '@/sync/global-session-status';
-import { applyGlobalSessionStatusSnapshot } from '@/sync/global-session-status';
-import { opencodeClient } from '@/lib/opencode/client';
 import { useGlobalBlockingRequestsStore } from '@/sync/global-blocking-requests';
 import { compareSessionsByLifecycleOrder, useSessionOrderingStore } from '@/sync/session-ordering';
 import { useNotificationStore } from '@/sync/notification-store';
@@ -40,18 +38,6 @@ const TRAY_ACTION_EVENT = 'openchamber:tray-action';
 const POLL_INTERVAL_MS = 5000;
 const FLUSH_DEBOUNCE_MS = 500;
 const MAX_SESSIONS = 20;
-
-const collectStatusPollDirectories = (): Map<string, string[]> => {
-  const result = new Map<string, string[]>();
-  for (const session of useGlobalSessionsStore.getState().activeSessions) {
-    const directory = resolveGlobalSessionDirectory(session);
-    if (!directory) continue;
-    const sessionIds = result.get(directory) ?? [];
-    sessionIds.push(session.id);
-    result.set(directory, sessionIds);
-  }
-  return result;
-};
 
 type TraySessionStatus = 'idle' | 'busy' | 'retry';
 
@@ -438,27 +424,6 @@ export const useTraySync = (): void => {
       void invokeDesktop('desktop_tray_update', snapshot);
     };
 
-    // Seed + reconcile the cross-project status map. The live path is the
-    // global event stream (captured by the sync dispatcher); this poll covers
-    // sessions already busy before this window opened and any missed events.
-    // Cheap: ~ms per directory, bounded by the tray's visible session count.
-    const refreshGlobalStatus = async () => {
-      const targets = collectStatusPollDirectories();
-      // OpenCode v2 reports active sessions globally, not per directory, so one
-      // fetch covers every tracked directory.
-      // null = fetch failed → keep every directory's current entries;
-      // a map without a session means that session is authoritatively idle.
-      const active = await opencodeClient.getActiveSessionStatuses();
-      if (disposed || active === null) return;
-      for (const [directory, sessionIds] of targets.entries()) {
-        const scoped: Record<string, SessionStatus> = {};
-        for (const sessionId of sessionIds) {
-          const status = active[sessionId];
-          if (status) scoped[sessionId] = status;
-        }
-        applyGlobalSessionStatusSnapshot(directory, scoped, sessionIds);
-      }
-    };
     // Coalesce bursts (e.g. token-by-token streaming updates a store rapidly)
     // into at most one push per FLUSH_DEBOUNCE_MS; discrete events surface within
     // that window. The main app UI stays instant via SSE/stores.

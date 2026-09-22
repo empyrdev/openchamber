@@ -34,7 +34,7 @@ describe('readHostToolVersions', () => {
   });
 
   it('rejects a manifest whose OpenCode dependency is a range', () => {
-    const manifest = tarball('range.json', JSON.stringify({ version: '1.0.0', dependencies: { '@opencode-ai/sdk': '^1.18.0' } }));
+    const manifest = tarball('range.json', JSON.stringify({ version: '1.0.0', dependencies: { '@opencode/client': '^2.0.12' } }));
     expect(() => readHostToolVersions(pathToFileURL(manifest))).toThrow(expect.objectContaining({ code: 'invalid_tools_version' }));
   });
 

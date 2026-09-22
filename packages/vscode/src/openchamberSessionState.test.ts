@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 
 import {
   type JsonValue,
@@ -81,11 +82,13 @@ describe('openchamber session state store', () => {
   });
 
   it('moves an unreadable file aside instead of overwriting it', async () => {
-    const memory = createMemoryFs({ '/data/sessions-archive.json': '{not json' });
+    const archivePath = path.join('/data', 'sessions-archive.json');
+    const corruptPath = path.join('/data', 'sessions-archive.json.corrupt-5');
+    const memory = createMemoryFs({ [archivePath]: '{not json' });
     const store = createSessionStateStore({ dataDir: '/data', fsPromises: memory.fsPromises, now: () => 5 });
 
     assert.deepEqual(await store.readArchived(), {});
-    assert.equal(memory.files.get('/data/sessions-archive.json.corrupt-5'), '{not json');
+    assert.equal(memory.files.get(corruptPath), '{not json');
   });
 
   it('merges metadata patches per key and deletes on null', async () => {

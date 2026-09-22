@@ -15,9 +15,6 @@ import { useAllLiveSessions } from '@/sync/sync-context';
 import { getFusionSessionTitle } from '@/lib/multirun/title';
 import { getMultiRunIdentity, isFusionSource } from '@/lib/multirun/identity';
 import { loadFusionOutputs, type FusionSource } from '@/lib/multirun/fusion';
-import { getSyncMessages, getSyncParts } from '@/sync/sync-refs';
-import { flattenAssistantTextParts } from '@/lib/messages/messageText';
-import { registerMultiRunSession } from '@/stores/useMultiRunStore';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { renderMagicPrompt } from '@/lib/magicPrompts';
 import { AgentSelector } from './AgentSelector';
@@ -34,28 +31,6 @@ const getSessionProjectDirectory = (sessionId: string, directory: string | null)
   return metadata?.projectDirectory ?? directory;
 };
 
-const getLastAssistantText = async (source: FusionSource): Promise<string> => {
-  const directory = source.directory ?? undefined;
-  const messages = getSyncMessages(source.session.id, directory);
-
-  if (messages.length === 0 && source.directory) {
-    // Newest first, so the first assistant record is the last reply.
-    const page = await opencodeClient.getSessionMessages(source.session.id, { limit: 50 }, source.directory);
-    for (const record of page.items) {
-      if (record.info.role !== 'assistant') continue;
-      return flattenAssistantTextParts(record.parts).trim();
-    }
-    return '';
-  }
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.role !== 'assistant') continue;
-    return flattenAssistantTextParts(getSyncParts(message.id, directory)).trim();
-  }
-
-  return '';
-};
 export function MultiRunFusionDialog({
   session,
   open,
@@ -69,7 +44,6 @@ export function MultiRunFusionDialog({
   const liveSessions = useAllLiveSessions();
   const activeSessions = useGlobalSessionsStore((state) => state.activeSessions);
   const archivedSessions = useGlobalSessionsStore((state) => state.archivedSessions);
-  const sessionsReady = useGlobalSessionsStore((state) => state.status === 'ready');
   const providers = useConfigStore((state) => state.providers);
   const currentProviderId = useConfigStore((state) => state.currentProviderId);
   const currentModelId = useConfigStore((state) => state.currentModelId);

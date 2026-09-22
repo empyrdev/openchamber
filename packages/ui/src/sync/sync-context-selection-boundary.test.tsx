@@ -75,7 +75,6 @@ describe('SyncProvider selection boundary', () => {
 
   test('bounds failed session-page retries and preserves the last directory snapshot', async () => {
     const dom = installHookTestDom()
-    const previousSurface = window.__OPENCHAMBER_SURFACE__
     window.__OPENCHAMBER_SURFACE__ = 'desktop'
     const root = createRoot(dom.container)
     let manager: ReturnType<typeof useChildStoreManager> | undefined
@@ -85,8 +84,8 @@ describe('SyncProvider selection boundary', () => {
     }
     let fail = false
     let failedPageRequests = 0
-    const list = spyOn(opencodeClient, 'listSessionsPage').mockImplementation(async () => {
-      if (fail) {
+    const list = spyOn(opencodeClient, 'listSessionsPage').mockImplementation(async (options) => {
+      if (fail && options?.directory === '/workspace/a') {
         failedPageRequests += 1
         throw Object.assign(new Error('OpenCode API unavailable'), { status: 503 })
       }

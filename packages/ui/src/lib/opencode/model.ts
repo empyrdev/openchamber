@@ -18,14 +18,19 @@ import type {
   AgentInfo,
   CommandInfo,
   ConfigEntry,
+  ConfigModelSettings as ConfigModelSettingsWire,
   FormInfo,
   JsonValue,
   McpServer,
   ModelInfo,
+  ModelSettings as ModelSettingsWire,
   ModelRef,
   PermissionRequest as PermissionRequestWire,
   PermissionRuleset,
+  ProviderCompaction as ProviderCompactionWire,
   ProviderInfo,
+  ProviderSettings as ProviderSettingsWire,
+  ProviderTransport as ProviderTransportWire,
   SessionForkBoundary,
   SessionRevert,
   SessionStatus as SessionStatusWire,
@@ -48,7 +53,14 @@ import type {
 export type Agent = Omit<AgentInfo, "name"> & { name: string; displayName: string }
 export type Command = CommandInfo
 export type Skill = SkillInfo
-export type Provider = ProviderInfo
+/** OpenCode 2.0.12 provider settings, including the app's persisted API-key setting. */
+export type ProviderSettings = ProviderSettingsWire & { apiKey?: string | null }
+/** The compaction strategy moved into model and provider settings in OpenCode 2.0.12. */
+export type ProviderCompaction = ProviderCompactionWire
+export type ProviderTransport = ProviderTransportWire
+export type ModelSettings = ModelSettingsWire
+export type ConfigModelSettings = ConfigModelSettingsWire
+export type Provider = Omit<ProviderInfo, "settings"> & { settings?: ProviderSettings }
 export type Model = ModelInfo
 export type McpServerStatus = McpServer
 /** Version-control facts about a directory the UI shows (current and default branch). */

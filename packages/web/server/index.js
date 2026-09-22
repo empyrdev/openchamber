@@ -944,14 +944,6 @@ const globalMessageStreamHub = createGlobalMessageStreamHub({
   deltaCoalesceWindowMs: resolveDeltaCoalesceWindowMs(),
 });
 
-// OpenChamber-owned events for the UI control stream (SSE) plus the WS fan-out.
-// OpenCode's /global/event proxy cannot carry them.
-const broadcastOpenChamberUiEvent = createGlobalUiEventBroadcaster({
-  sseClients: uiOpenChamberEventClients,
-  wsClients: uiNotificationWsClients,
-  writeSseEvent,
-});
-
 // Jev model routing and the permission safety net. Dark unless
 // OPENCHAMBER_ROUTING_ENABLE is set; every failure keeps the user's own model
 // or the auto-accept reply it was asked about.

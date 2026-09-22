@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import { projectCredentialValue, readCredentialsFromDb, resolveCredentialDbPath } from './opencodeAuth';
 
 type Sqlite = { DatabaseSync: new (p: string) => { exec: (s: string) => void; prepare: (s: string) => { run: (...a: unknown[]) => void }; close: () => void } };
+type BunRuntime = { gc: (force: boolean) => void };
 const sqlite = ((): Sqlite | null => {
   try {
     // SAFETY: node:sqlite is a built-in with a fixed surface; the test only
@@ -17,6 +18,30 @@ const sqlite = ((): Sqlite | null => {
     return null;
   }
 })();
+const bunRuntime: BunRuntime | null = process.versions.bun ? createRequire(__filename)('bun') : null;
+
+const createCredentialDatabase = (dbPath: string) => {
+  const db = new sqlite!.DatabaseSync(dbPath);
+  try {
+    db.exec(
+      'CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL, ' +
+        'active INTEGER, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)',
+    );
+    db.prepare('INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)').run('c1', 'openai', 'old', JSON.stringify({ type: 'oauth', access: 'old', refresh: 'r', expires: 1 }), 0, 9, 9);
+    db.prepare('INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)').run('c2', 'openai', 'new', JSON.stringify({ type: 'oauth', access: 'new', refresh: 'r', expires: 2 }), 1, 1, 1);
+    db.prepare('INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)').run('c3', 'opencode-go', 'k', JSON.stringify({ type: 'key', key: 'go' }), null, 1, 1);
+  } finally {
+    db.close();
+  }
+};
+
+const releaseBunSqliteStatements = () => {
+  if (!bunRuntime) return;
+  // Bun 1.4.2 keeps node:sqlite prepared statements alive until collection,
+  // even after DatabaseSync.close(). The assertion has already exercised the
+  // read-only connection; collect before verifying its temp directory closes.
+  bunRuntime.gc(true);
+};
 
 describe('projectCredentialValue', () => {
   it('maps key and oauth rows to the legacy entry shape', () => {
@@ -39,8 +64,7 @@ describe('resolveCredentialDbPath', () => {
 
 describe('readCredentialsFromDb', () => {
   it('returns the active credential per integration and null without a database', () => {
-    // Bun runs this file too and has no `node:sqlite`; the reader then answers
-    // null by design, which is the only thing worth asserting there.
+    // Runtimes without `node:sqlite` answer null by design.
     if (!sqlite) {
       assert.equal(readCredentialsFromDb(path.join(os.tmpdir(), 'nowhere', 'opencode.db')), null);
       return;
@@ -50,21 +74,13 @@ describe('readCredentialsFromDb', () => {
       const dbPath = path.join(dir, 'opencode.db');
       assert.equal(readCredentialsFromDb(dbPath), null);
 
-      const db = new sqlite!.DatabaseSync(dbPath);
-      db.exec(
-        'CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL, ' +
-          'active INTEGER, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL)',
-      );
-      const insert = db.prepare('INSERT INTO credential VALUES (?, ?, ?, ?, ?, ?, ?)');
-      insert.run('c1', 'openai', 'old', JSON.stringify({ type: 'oauth', access: 'old', refresh: 'r', expires: 1 }), 0, 9, 9);
-      insert.run('c2', 'openai', 'new', JSON.stringify({ type: 'oauth', access: 'new', refresh: 'r', expires: 2 }), 1, 1, 1);
-      insert.run('c3', 'opencode-go', 'k', JSON.stringify({ type: 'key', key: 'go' }), null, 1, 1);
-      db.close();
+      createCredentialDatabase(dbPath);
 
       assert.deepEqual(readCredentialsFromDb(dbPath), {
         openai: { type: 'oauth', access: 'new', refresh: 'r', expires: 2 },
         'opencode-go': { type: 'api', key: 'go' },
       });
+      releaseBunSqliteStatements();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
