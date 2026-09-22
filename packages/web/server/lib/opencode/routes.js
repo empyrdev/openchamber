@@ -9,6 +9,8 @@ import { getClaudeCliAuthStatus } from './claude-cli-auth.js';
 import { OPENCODE_CONFIG_DIR } from './shared.js';
 import { settingsSurfaceOf } from './settings-files.js';
 
+const HEALTH_CHECK_TIMEOUT_MS = 5000;
+
 export const registerOpenCodeRoutes = (app, dependencies) => {
   const {
     crypto,
@@ -27,6 +29,7 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
     refreshOpenCodeAfterConfigChange,
     buildOpenCodeUrl,
     getOpenCodeAuthHeaders,
+    healthCheckTimeoutMs = HEALTH_CHECK_TIMEOUT_MS,
     fsPromises = fs.promises,
   } = dependencies;
 
@@ -163,24 +166,51 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
   });
 
   app.get('/api/opencode/health', async (_req, res) => {
+    const controller = new AbortController();
+    const abortUpstream = () => controller.abort();
+    const abortOnDownstreamClose = () => {
+      if (!res.writableEnded) abortUpstream();
+    };
+    let timeout = null;
+    res.once('close', abortOnDownstreamClose);
     try {
-      const healthResponse = await fetch(buildOpenCodeUrl('/api/health', ''), {
+      timeout = setTimeout(abortUpstream, healthCheckTimeoutMs);
+      timeout.unref?.();
+      const infoResponse = await fetch(buildOpenCodeUrl('/api/info', ''), {
         method: 'GET',
         headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
+        signal: controller.signal,
       });
-      const health = await healthResponse.json().catch(() => null);
-      if (!healthResponse.ok) {
-        return res.status(healthResponse.status).json({
+      if (!infoResponse.ok) {
+        void infoResponse.body?.cancel().catch(() => {});
+        return res.status(infoResponse.status).json({
           healthy: false,
-          error: health?.error || healthResponse.statusText || 'OpenCode health check failed',
+          error: 'OpenCode health check failed',
         });
       }
-      return res.json({ healthy: health?.healthy === true });
+      let info = null;
+      try {
+        info = await infoResponse.json();
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+      }
+      const version = info?.version?.trim?.() ?? '';
+      if (!version || !Number.isFinite(info?.pid) || info.pid <= 0) {
+        return res.status(502).json({
+          healthy: false,
+          error: 'Invalid OpenCode health response',
+        });
+      }
+      return res.json({ healthy: true });
     } catch (error) {
+      if (res.writableEnded || res.destroyed) return;
       return res.status(503).json({
         healthy: false,
-        error: error instanceof Error ? error.message : 'OpenCode health check failed',
+        error: 'OpenCode health check failed',
       });
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      res.off('close', abortOnDownstreamClose);
     }
   });
 

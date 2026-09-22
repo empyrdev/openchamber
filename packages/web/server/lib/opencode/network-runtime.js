@@ -45,8 +45,9 @@ export const createOpenCodeNetworkRuntime = (deps) => {
       let timeout = null;
       try {
         const controller = new AbortController();
-        timeout = setTimeout(() => controller.abort(), 3000);
-        const response = await fetch(`${url.replace(/\/+$/, '')}/api/health`, {
+        const remainingMs = timeoutMs - (Date.now() - start);
+        timeout = setTimeout(() => controller.abort(), Math.min(3000, remainingMs));
+        const response = await fetch(`${url.replace(/\/+$/, '')}/api/info`, {
           method: 'GET',
           headers: {
             Accept: 'application/json',
@@ -54,24 +55,87 @@ export const createOpenCodeNetworkRuntime = (deps) => {
           },
           signal: controller.signal,
         });
-        clearTimeout(timeout);
-        timeout = null;
 
-        if (response.ok) {
-          const body = await response.json().catch(() => null);
-          if (body?.healthy === true) {
-            return true;
-          }
+        if (response.status === 401) {
+          return {
+            ready: false,
+            retryable: false,
+            failure: {
+              class: 'authentication',
+              detail: 'OpenCode readiness authentication failed (HTTP 401). Check the managed server password.',
+            },
+          };
         }
+        if (response.status === 404) {
+          return {
+            ready: false,
+            retryable: false,
+            failure: {
+              class: 'incompatible_endpoint',
+              detail: 'OpenCode readiness endpoint /api/info is unavailable (HTTP 404). Update OpenCode to a compatible version.',
+            },
+          };
+        }
+        if (response.status !== 200) {
+          return {
+            ready: false,
+            retryable: false,
+            failure: {
+              class: 'invalid_response',
+              detail: `OpenCode readiness endpoint returned HTTP ${response.status ?? 'unknown'}.`,
+            },
+          };
+        }
+
+        let body;
+        try {
+          body = await response.json();
+        } catch (error) {
+          if (controller.signal.aborted) {
+            throw error;
+          }
+          return {
+            ready: false,
+            retryable: false,
+            failure: {
+              class: 'invalid_response',
+              detail: 'OpenCode readiness endpoint returned invalid JSON.',
+            },
+          };
+        }
+        const version = typeof body?.version === 'string' ? body.version.trim() : '';
+        const pid = body?.pid;
+        if (!version || !Number.isFinite(pid) || pid <= 0) {
+          return {
+            ready: false,
+            retryable: false,
+            failure: {
+              class: 'invalid_response',
+              detail: 'OpenCode readiness endpoint must return a non-empty version and positive finite pid.',
+            },
+          };
+        }
+        return { ready: true, version, pid };
       } catch {
       } finally {
         if (timeout) {
           clearTimeout(timeout);
         }
       }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      const remainingMs = timeoutMs - (Date.now() - start);
+      if (remainingMs <= 0) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(100, remainingMs)));
     }
-    return false;
+    return {
+      ready: false,
+      retryable: true,
+      failure: {
+        class: 'unreachable',
+        detail: 'OpenCode readiness endpoint did not become reachable before the startup deadline.',
+      },
+    };
   };
 
   const setDetectedOpenCodeApiPrefix = () => {

@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import http from 'node:http';
 import express from 'express';
 import path from 'path';
 
 import { createSseBoundaryTracker, registerOpenCodeProxy, writeSseChunkWithBackpressure } from './lib/opencode/proxy.js';
+
+const originalFetch = globalThis.fetch;
 
 const listen = (app, host = '127.0.0.1') => new Promise((resolve, reject) => {
   const server = app.listen(0, host, () => resolve(server));
@@ -24,16 +27,54 @@ const closeServer = (server) => new Promise((resolve, reject) => {
   });
 });
 
+const getJson = (url, timeoutMs = 0) => new Promise((resolve, reject) => {
+  const request = http.get(url, (response) => {
+    let body = '';
+    response.setEncoding('utf8');
+    response.on('data', (chunk) => { body += chunk; });
+    response.on('end', () => {
+      try {
+        resolve({ status: response.statusCode, body: JSON.parse(body) });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+  if (timeoutMs > 0) {
+    request.setTimeout(timeoutMs, () => request.destroy(new Error('Timed out waiting for proxy response')));
+  }
+  request.once('error', reject);
+});
+
 describe('OpenCode proxy SSE forwarding', () => {
   let upstreamServer;
   let proxyServer;
 
   afterEach(async () => {
+    globalThis.fetch = originalFetch;
     await closeServer(proxyServer);
     await closeServer(upstreamServer);
     proxyServer = undefined;
     upstreamServer = undefined;
   });
+
+  const registerSessionListProxy = (app, overrides = {}) => {
+    registerOpenCodeProxy(app, {
+      fs: {},
+      OPEN_CODE_READY_GRACE_MS: 0,
+      LONG_REQUEST_TIMEOUT_MS: 20,
+      getRuntime: () => ({
+        openCodePort: 4096,
+        isOpenCodeReady: true,
+        openCodeNotReadySince: 0,
+        isRestartingOpenCode: false,
+      }),
+      getOpenCodeAuthHeaders: () => ({ Authorization: 'Basic managed-password' }),
+      buildOpenCodeUrl: (requestPath) => `http://127.0.0.1:4096${requestPath}`,
+      ensureOpenCodeApiPrefix: () => {},
+      ...overrides,
+    });
+  };
 
   it('forwards event streams with nginx-safe headers', async () => {
     let seenAuthorization = null;
@@ -84,12 +125,29 @@ describe('OpenCode proxy SSE forwarding', () => {
 
   it('closes downstream SSE when the OpenCode upstream stalls despite proxy heartbeats', async () => {
     let stallTimeoutReads = 0;
+    let releaseUpstreamFrames;
+    let upstreamClosed = false;
+    let lateWriteAttempted = false;
+    const upstreamFrames = new Promise((resolve) => {
+      releaseUpstreamFrames = resolve;
+    });
     const upstream = express();
     upstream.get('/api/event', (_req, res) => {
       res.setHeader('Content-Type', 'text/event-stream');
       res.flushHeaders();
-      setTimeout(() => res.write(':upstream-alive\n\n'), 40);
-      setTimeout(() => res.write('data: still-alive\n\n'), 80);
+      let lateWriteTimer = null;
+      res.once('close', () => {
+        upstreamClosed = true;
+        clearTimeout(lateWriteTimer);
+      });
+      upstreamFrames.then(() => {
+        res.write(':upstream-alive\n\n');
+        setTimeout(() => res.write('data: still-alive\n\n'), 20);
+        lateWriteTimer = setTimeout(() => {
+          lateWriteAttempted = true;
+          res.write('data: too-late\n\n');
+        }, 200);
+      });
     });
     upstreamServer = await listen(upstream);
     const upstreamPort = upstreamServer.address().port;
@@ -124,11 +182,30 @@ describe('OpenCode proxy SSE forwarding', () => {
     });
 
     expect(response.status).toBe(200);
-    const body = await response.text();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let body = '';
+    const firstChunk = await reader.read();
+    body += decoder.decode(firstChunk.value, { stream: true });
+    expect(body).toContain(':heartbeat\n\n');
+
+    // The first downstream heartbeat is emitted only after the proxy has set up
+    // its upstream reader and stall watchdog. Release upstream data then, rather
+    // than racing a 40ms fixture timer against the 50ms initial watchdog.
+    releaseUpstreamFrames();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+
     expect(body).toContain(':heartbeat\n\n');
     expect(body).toContain(':upstream-alive\n\n');
     expect(body).toContain('data: still-alive\n\n');
     expect(stallTimeoutReads).toBeGreaterThanOrEqual(3);
+    await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+    expect(lateWriteAttempted).toBe(false);
   });
 
   it('holds a request through OpenCode warmup and succeeds once ready (no 503/backoff)', async () => {
@@ -446,6 +523,125 @@ describe('OpenCode proxy SSE forwarding', () => {
       ],
       cursor: { next: '123' },
     });
+  });
+
+  it('returns a sanitized timeout when authoritative session-list headers stall', async () => {
+    globalThis.fetch = vi.fn((_url, options) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    }));
+    const app = express();
+    registerSessionListProxy(app);
+    proxyServer = await listen(app);
+    const proxyPort = proxyServer.address().port;
+
+    const response = await getJson(`http://127.0.0.1:${proxyPort}/api/session?cursor=opaque-next`, 100);
+
+    expect(response.status).toBe(504);
+    expect(response.body).toEqual({ error: 'OpenCode upstream timed out' });
+  });
+
+  it('returns a sanitized timeout when authoritative session-list body consumption stalls', async () => {
+    globalThis.fetch = vi.fn(async (_url, options) => ({
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: () => new Promise((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+      }),
+    }));
+    const app = express();
+    registerSessionListProxy(app);
+    proxyServer = await listen(app);
+    const proxyPort = proxyServer.address().port;
+
+    const response = await getJson(`http://127.0.0.1:${proxyPort}/api/session?cursor=opaque-next`, 100);
+
+    expect(response.status).toBe(504);
+    expect(response.body).toEqual({ error: 'OpenCode upstream timed out' });
+  });
+
+  it('cancels authoritative session-list work when the downstream disconnects', async () => {
+    let signal = null;
+    globalThis.fetch = vi.fn((_url, options) => {
+      signal = options.signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    const app = express();
+    registerSessionListProxy(app, { LONG_REQUEST_TIMEOUT_MS: 1_000 });
+    proxyServer = await listen(app);
+    const proxyPort = proxyServer.address().port;
+
+    const downstream = http.get(`http://127.0.0.1:${proxyPort}/api/session`);
+    downstream.on('error', () => {});
+    await vi.waitFor(() => expect(globalThis.fetch).toHaveBeenCalledOnce());
+    downstream.destroy();
+
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+  });
+
+  it('uses one authoritative paginated v2 session list on Windows', async () => {
+    const seen = [];
+    const upstream = express();
+    upstream.get('/api/session', (req, res) => {
+      seen.push({ query: req.query, authorization: req.headers.authorization });
+      res.json({
+        data: [{
+          id: 'ses_global',
+          title: 'Global session',
+          time: { updated: 1 },
+          metadata: { shared: 'upstream' },
+        }],
+        cursor: { next: 'opaque-next-page' },
+      });
+    });
+    upstreamServer = await listen(upstream);
+    const upstreamPort = upstreamServer.address().port;
+    const externalBaseUrl = `http://127.0.0.1:${upstreamPort}`;
+
+    const app = express();
+    registerOpenCodeProxy(app, {
+      fs: {
+        readFileSync: () => {
+          throw new Error('The retired Windows merge must not read settings');
+        },
+      },
+      platform: 'win32',
+      OPEN_CODE_READY_GRACE_MS: 0,
+      getRuntime: () => ({
+        openCodePort: upstreamPort,
+        openCodeBaseUrl: externalBaseUrl,
+        isOpenCodeReady: true,
+        openCodeNotReadySince: 0,
+        isRestartingOpenCode: false,
+      }),
+      getOpenCodeAuthHeaders: () => ({ Authorization: 'Basic managed-password' }),
+      buildOpenCodeUrl: (requestPath) => `${externalBaseUrl}${requestPath}`,
+      ensureOpenCodeApiPrefix: () => {},
+      getArchivedSessions: async () => ({ ses_global: 42 }),
+      getStoredSessionMetadata: async () => ({ ses_global: { shared: 'openchamber' } }),
+    });
+    proxyServer = await listen(app);
+    const proxyPort = proxyServer.address().port;
+
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/api/session?limit=500&roots=true`);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      data: [{
+        id: 'ses_global',
+        title: 'Global session',
+        time: { updated: 1, archived: 42 },
+        metadata: { shared: 'openchamber' },
+      }],
+      cursor: { next: 'opaque-next-page' },
+    });
+    expect(seen).toEqual([
+      {
+        query: { limit: '500', roots: 'true' },
+        authorization: 'Basic managed-password',
+      },
+    ]);
   });
 
   it('sanitizes session list responses without sanitizing session detail responses', async () => {

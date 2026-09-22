@@ -150,6 +150,7 @@ is the extension-host mirror.
 
 ## Public exports (routes.js)
 - `registerOpenCodeRoutes(app, dependencies)`: Registers OpenCode-owned HTTP routes and internal module runtime:
+  - `GET /api/opencode/health` checks authenticated OpenCode v2 `/api/info`; only a non-empty `version` and positive finite `pid` answer `{ healthy: true }`. A server-owned deadline covers headers and body consumption, downstream disconnects cancel the upstream request, and unused non-OK bodies are cancelled. Upstream failures and malformed info remain explicit public failures without forwarding upstream details.
   - `GET /api/config/settings`
   - `PUT /api/config/settings`
   - `GET /api/config/opencode-resolution`
@@ -194,6 +195,10 @@ The runtime maintains active-session count incrementally from idempotent activit
   - `waitForPortRelease(port, timeoutMs, hostname?)`
   - `killProcessOnPort(port)`
 
+`waitForOpenCodeReady()` resolves only after the managed `/api/info` predicate
+is healthy. It throws terminal readiness errors immediately and throws the last
+transport error (or a timeout) when the overall deadline expires.
+
 Managed OpenCode launch also merges the environment returned by the agent-tool
 runtime and the opt-in system prompt optimizer, each appending its `file://`
 entry to the previous one's config. OpenChamber adds no automatic MCP reconnect
@@ -218,14 +223,32 @@ macOS `say` voice enumeration starts concurrently with server composition. The s
 
 Transport-triggered health checks share the periodic monitor's failure accounting interval. Rapid WS reconnect callbacks therefore cannot exhaust the managed-process restart threshold using one cached unhealthy result; an exited managed process still restarts immediately.
 
-Managed health failures are classified as `timeout`, `connection_refused`, `connection_reset`, `invalid_response`, or `error`. The lifecycle retains the latest counted failure with a bounded detail string and source. Managed process wrappers continue capturing a sanitized, bounded stderr tail after readiness and retain exit code/signal. Before replacing a managed process, lifecycle snapshots the reason, latest health failure, process diagnostics/aliveness, busy-session count, and timestamp into `lastOpenCodeRestartDiagnostics`; successful startup does not clear this snapshot, and `/health` exposes it for post-restart diagnosis without process environment or credentials.
+Managed readiness and health failures are classified as `authentication`,
+`incompatible_endpoint`, `timeout`, `connection_refused`, `connection_reset`,
+`invalid_response`, or `error`. The lifecycle retains the latest counted failure
+with a bounded detail string and source. Managed process wrappers continue
+capturing a sanitized, bounded stderr tail after readiness and retain exit
+code/signal. Before replacing a managed process, lifecycle snapshots the reason,
+latest health failure, process diagnostics/aliveness, busy-session count, and
+timestamp into `lastOpenCodeRestartDiagnostics`; successful startup does not
+clear this snapshot, and `/health` exposes it for post-restart diagnosis without
+process environment or credentials.
 
 Managed process ownership starts at spawn. The registry and runtime process
 handle include children that have not announced readiness yet, so shutdown can
 stop an in-flight startup. Readiness timeout, malformed startup output, and
-health-probe errors close that child before retrying. Shutdown cancels further
+health-probe errors close that child before retrying. Terminal readiness failures
+also close the child, then reject without retrying. Shutdown cancels further
 startup attempts. Closing a process is single-flight and unregisters it only
 after it exits.
+
+Readiness probes use authenticated `GET /api/info`. A ready response is HTTP
+200 JSON with a trimmed non-empty string `version` and a positive finite `pid`.
+They return structured terminal failures for authentication (401), an
+incompatible endpoint (404), and malformed or invalid bodies; unreachable
+servers remain retryable within the overall readiness deadline. Each attempt's
+abort signal remains active while consuming the response body, and is cleaned
+up for both terminal and retryable outcomes.
 
 On Windows, managed teardown invokes the existing tree termination command
 before terminating the root. Calling `child.kill()` first loses the ancestry
@@ -288,6 +311,14 @@ ConPTY or Console Window Host behavior.
   - `buildOpenCodeUrl(path, prefixOverride?)`
   - `ensureOpenCodeApiPrefix()`
   - `scheduleOpenCodeApiDetection()`
+
+`waitForReady()` uses the same `/api/info` predicate and returns either
+`{ ready: true, version, pid }` or `{ ready: false, retryable, failure }`, where
+`failure` has a class and safe diagnostic detail. Authentication (401),
+incompatible endpoint (404), and invalid responses are terminal; transport
+failures are retryable until the overall deadline. Its per-attempt abort is
+bounded by the time remaining in that deadline and is cleared after the response
+body has been consumed.
 
 ## Public exports (settings-runtime.js)
 - `createSettingsRuntime(dependencies)`: creates settings lifecycle runtime for read/migrate/persist concerns.
@@ -738,7 +769,7 @@ within a ten-minute overall deadline.
   - Upstream paths are the request paths. OpenCode 2.x serves everything under `/api/*` itself, so the mount prefix Express strips is put back instead of being rewritten away.
   - There is no interactive OAuth forwarder any more: v2 connects providers through `/api/integration/*`, whose OAuth steps return immediately and are polled, so no route needs a longer deadline than the ordinary one.
   - Generic `/api/*` forwarding with hop-by-hop header filtering
-  - Windows `/session` merge fallback path behavior
+  - Every platform uses the authoritative paginated v2 `/api/session` list response. The ordinary list handler preserves query/cursor/auth and applies session sanitization plus OpenChamber archive/metadata overlays. Its server-owned deadline covers headers and body consumption; an abandoned downstream request cancels unfinished upstream work, while a connected client receives a sanitized timeout failure rather than partial data.
   - OpenCode readiness gate for proxied `/api` requests
   - Worktree checkout gate before directory-scoped upstream reads and writes
 

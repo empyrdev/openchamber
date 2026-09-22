@@ -268,8 +268,8 @@ const sanitizeSessionListItem = (session) => {
 };
 
 /**
- * v2 answers a session list with `{ data, cursor }`. A bare array is still
- * accepted so a merged list assembled here can go through the same path.
+ * v2 answers a session list with `{ data, cursor }`. Preserve that envelope so
+ * clients can follow OpenCode's opaque pagination cursors.
  */
 const sanitizeSessionListPayload = (payload) => {
   if (Array.isArray(payload)) {
@@ -290,8 +290,6 @@ const sessionListRecords = (payload) => {
 export const registerOpenCodeProxy = (app, deps) => {
   const {
     fs,
-    os,
-    path,
     OPEN_CODE_READY_GRACE_MS,
     LONG_REQUEST_TIMEOUT_MS,
     getRuntime,
@@ -704,7 +702,7 @@ export const registerOpenCodeProxy = (app, deps) => {
     }
   };
 
-  const fetchSessionListPayload = async (upstreamPath, { req = null, timeoutMs = null } = {}) => {
+  const fetchSessionListPayload = async (upstreamPath, { req = null, signal } = {}) => {
     const headers = req
       ? {
           ...normalizeForwardedDirectoryHeaders(collectForwardProxyHeaders(req.headers, getOpenCodeAuthHeaders())),
@@ -719,7 +717,7 @@ export const registerOpenCodeProxy = (app, deps) => {
     const upstream = await fetch(buildOpenCodeUrl(upstreamPath, ''), {
       method: 'GET',
       headers,
-      ...(typeof timeoutMs === 'number' ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
+      signal,
     });
     const contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
     const bodyText = await upstream.text();
@@ -747,9 +745,17 @@ export const registerOpenCodeProxy = (app, deps) => {
   };
 
   const forwardSanitizedSessionListRequest = async (req, res, next, logLabel) => {
+    const controller = new AbortController();
+    const abortUpstream = () => controller.abort();
+    const abortOnDownstreamClose = () => {
+      if (!res.writableEnded) abortUpstream();
+    };
+    const timeout = setTimeout(abortUpstream, PROXY_REQUEST_TIMEOUT_MS);
+    timeout.unref?.();
+    res.once('close', abortOnDownstreamClose);
     try {
       const upstreamPath = await getRequestUpstreamPath(req);
-      const result = await fetchSessionListPayload(upstreamPath, { req });
+      const result = await fetchSessionListPayload(upstreamPath, { req, signal: controller.signal });
 
       res.status(result.upstream.status);
       applyForwardProxyResponseHeaders(result.upstream.headers, res);
@@ -769,7 +775,10 @@ export const registerOpenCodeProxy = (app, deps) => {
       res.setHeader('content-type', result.contentType);
       res.json(await overlayOwnedStateOnList(sanitizeSessionListPayload(result.payload)));
     } catch (error) {
-      if (isAbortError(error)) {
+      if (controller.signal.aborted) {
+        if (!res.writableEnded && !res.destroyed) {
+          sendProxyErrorResponse(res, 504);
+        }
         return;
       }
       console.error(`[proxy] OpenCode ${logLabel} proxy error:`, error?.message ?? error);
@@ -778,6 +787,9 @@ export const registerOpenCodeProxy = (app, deps) => {
         return;
       }
       next(error);
+    } finally {
+      clearTimeout(timeout);
+      res.off('close', abortOnDownstreamClose);
     }
   };
 
@@ -896,86 +908,6 @@ export const registerOpenCodeProxy = (app, deps) => {
       next(error);
     }
   });
-
-  // Windows: session merge for cross-directory session listing
-  if (process.platform === 'win32') {
-    app.get('/api/session', async (req, res, next) => {
-      const rawUrl = req.originalUrl || req.url || '';
-      if (rawUrl.includes('directory=')) return next();
-
-      const fetchWindowsSessionList = async (sessionPath) => {
-        const result = await fetchSessionListPayload(sessionPath, { req, timeoutMs: 10000 });
-        if (!result.upstream.ok || !Array.isArray(result.payload)) return null;
-        return sanitizeSessionListPayload(result.payload);
-      };
-
-      try {
-        const globalSessions = await fetchWindowsSessionList('/session').catch((error) => {
-          console.log(`[SessionMerge] Global session list failed: ${error.message}`);
-          return null;
-        });
-
-        const settingsPath = path.join(os.homedir(), '.config', 'openchamber', 'settings.json');
-        let projectDirs = [];
-        try {
-          const settingsRaw = fs.readFileSync(settingsPath, 'utf8');
-          const settings = JSON.parse(settingsRaw);
-          projectDirs = (settings.projects || [])
-            .map((project) => (typeof project?.path === 'string' ? project.path.trim() : ''))
-            .filter(Boolean);
-        } catch {
-        }
-
-        const seen = new Set(
-          (globalSessions || [])
-            .map((session) => (session && typeof session.id === 'string' ? session.id : null))
-            .filter((id) => typeof id === 'string')
-        );
-        const extraSessions = [];
-        let successfulProjectReads = 0;
-        for (const dir of projectDirs) {
-          const candidates = Array.from(new Set([
-            dir,
-            dir.replace(/\\/g, '/'),
-            dir.replace(/\//g, '\\'),
-          ]));
-          for (const candidateDir of candidates) {
-            const encoded = encodeURIComponent(candidateDir);
-            try {
-              const dirSessions = await fetchWindowsSessionList(`/session?directory=${encoded}`);
-              if (dirSessions) {
-                successfulProjectReads += 1;
-              }
-              for (const session of dirSessions || []) {
-                const id = session && typeof session.id === 'string' ? session.id : null;
-                if (id && !seen.has(id)) {
-                  seen.add(id);
-                  extraSessions.push(session);
-                }
-              }
-            } catch {
-            }
-          }
-        }
-
-        if (!globalSessions && successfulProjectReads === 0) {
-          return res.status(504).json({ error: 'OpenCode session list timed out' });
-        }
-
-        const merged = [...(globalSessions || []), ...extraSessions];
-        merged.sort((a, b) => {
-          const aTime = a && typeof a.time_updated === 'number' ? a.time_updated : 0;
-          const bTime = b && typeof b.time_updated === 'number' ? b.time_updated : 0;
-          return bTime - aTime;
-        });
-        console.log(`[SessionMerge] ${globalSessions?.length || 0} global + ${extraSessions.length} extra = ${merged.length} total`);
-        return res.json(sanitizeSessionListPayload(merged));
-      } catch (error) {
-        console.log(`[SessionMerge] Error: ${error.message}`);
-        return res.status(500).json({ error: error.message || 'Failed to merge Windows sessions' });
-      }
-    });
-  }
 
   app.get('/api/session', (req, res, next) => {
     return forwardSanitizedSessionListRequest(req, res, next, 'session.list');

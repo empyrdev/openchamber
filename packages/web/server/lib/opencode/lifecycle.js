@@ -17,7 +17,7 @@ const HEALTH_CHECK_MAX_CONSECUTIVE_FAILURES = parsePositiveInt(
 );
 const HEALTH_CHECK_INTERVAL_OVERRIDE_MS = parsePositiveInt(process.env.OPENCHAMBER_OPENCODE_HEALTH_INTERVAL_MS, 0);
 const HEALTH_CHECK_RESULT_CACHE_MS = parsePositiveInt(process.env.OPENCHAMBER_OPENCODE_HEALTH_CACHE_MS, 750);
-const OPENCODE_HEALTH_PATH = '/api/health';
+const OPENCODE_INFO_PATH = '/api/info';
 const OPENCODE_REQUIRED_MAJOR_VERSION = 2;
 
 /**
@@ -26,23 +26,90 @@ const OPENCODE_REQUIRED_MAJOR_VERSION = 2;
  * config key, so an older binary fails in a hundred small ways instead of one
  * clear one.
  *
- * The version comes from the health payload rather than from `opencode
+ * The version comes from the server-info payload rather than from `opencode
  * --version`: it costs no extra process, and it also covers an external
- * OpenCode the user started themselves. `/api/health` only exists in 2.x, so a
- * 404 there is the same answer by another route.
+ * OpenCode the user started themselves.
  */
 const OPENCODE_VERSION_REQUIREMENT_DETAIL =
   `OpenChamber requires OpenCode ${OPENCODE_REQUIRED_MAJOR_VERSION}.x`;
 
 const classifyOpenCodeVersion = (version) => {
-  if (typeof version !== 'string') return { ok: true };
-  const match = version.match(/v?(\d+)\./);
+  const match = version?.match?.(/v?(\d+)\./);
   if (!match) return { ok: true };
   if (Number(match[1]) >= OPENCODE_REQUIRED_MAJOR_VERSION) return { ok: true };
   return {
     ok: false,
     detail: `${OPENCODE_VERSION_REQUIREMENT_DETAIL}, found ${version.trim()}. Update OpenCode and start OpenChamber again.`,
   };
+};
+
+const classifyOpenCodeInfoResponse = async (response, signal) => {
+  if (response.status === 401) {
+    return {
+      healthy: false,
+      failure: {
+        class: 'authentication',
+        detail: 'OpenCode readiness authentication failed (HTTP 401). Check the server password.',
+      },
+    };
+  }
+  if (response.status === 404) {
+    return {
+      healthy: false,
+      failure: {
+        class: 'incompatible_endpoint',
+        detail: 'OpenCode readiness endpoint /api/info is unavailable (HTTP 404). Update OpenCode to a compatible version.',
+      },
+    };
+  }
+  if (response.status !== 200) {
+    return {
+      healthy: false,
+      failure: {
+        class: 'invalid_response',
+        detail: `OpenCode readiness endpoint returned HTTP ${response.status ?? 'unknown'}.`,
+      },
+    };
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    if (signal?.aborted) {
+      throw error;
+    }
+    return {
+      healthy: false,
+      failure: { class: 'invalid_response', detail: 'OpenCode readiness endpoint returned invalid JSON.' },
+    };
+  }
+
+  const version = typeof body?.version === 'string' ? body.version.trim() : '';
+  const pid = body?.pid;
+  if (!version || !Number.isFinite(pid) || pid <= 0) {
+    return {
+      healthy: false,
+      failure: {
+        class: 'invalid_response',
+        detail: 'OpenCode readiness endpoint must return a non-empty version and positive finite pid.',
+      },
+    };
+  }
+
+  const versionResult = classifyOpenCodeVersion(version);
+  if (!versionResult.ok) {
+    return { healthy: false, failure: { class: 'incompatible_endpoint', detail: versionResult.detail } };
+  }
+  return { healthy: true, failure: null };
+};
+
+const readinessError = (failure) => {
+  const error = new Error(failure?.detail || 'OpenCode readiness check failed.');
+  if (failure?.retryable === false) {
+    error.code = `OPENCODE_READINESS_${String(failure.class || 'FAILED').toUpperCase()}`;
+  }
+  return error;
 };
 // Last-used directory plus the three most recently opened projects — deeper
 // tails are unlikely to be the user's first click and just add background work.
@@ -497,11 +564,16 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
       const onStdout = (chunk) => {
         stdout += chunk.toString();
         const lines = stdout.split('\n');
+        stdout = lines.pop();
         for (const line of lines) {
           // OpenCode 2.x prints `server listening on http://host:port` with no
           // "opencode" prefix.
+          if (!/server listening\b/.test(line)) continue;
           const match = line.match(/server listening on\s+(https?:\/\/\S+)/);
-          if (!match) continue;
+          if (!match) {
+            finish(reject, new Error('Failed to parse server url'));
+            return;
+          }
           attachRuntimeStderrCapture();
           finish(resolve, match[1]);
           return;
@@ -595,54 +667,16 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
     }
 
     try {
-      const response = await fetch(buildOpenCodeUrl(OPENCODE_HEALTH_PATH, ''), {
+      const signal = AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS);
+      const response = await fetch(buildOpenCodeUrl(OPENCODE_INFO_PATH, ''), {
         method: 'GET',
         headers: {
           Accept: 'application/json',
           ...getOpenCodeAuthHeaders(),
         },
-        signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
+        signal,
       });
-      if (!response.ok) {
-        return {
-          healthy: false,
-          failure: {
-            class: 'invalid_response',
-            detail: response.status === 404
-              ? `${OPENCODE_VERSION_REQUIREMENT_DETAIL}: this server has no /api/health, which every 2.x server serves.`
-              : `Health endpoint returned HTTP ${response.status ?? 'unknown'}`,
-          },
-        };
-      }
-      let body;
-      try {
-        body = await response.json();
-      } catch {
-        return {
-          healthy: false,
-          failure: {
-            class: 'invalid_response',
-            detail: 'Health endpoint returned invalid JSON',
-          },
-        };
-      }
-      if (body?.healthy !== true) {
-        return {
-          healthy: false,
-          failure: {
-            class: 'invalid_response',
-            detail: 'Health endpoint did not report healthy=true',
-          },
-        };
-      }
-      const version = classifyOpenCodeVersion(body?.version);
-      if (!version.ok) {
-        return {
-          healthy: false,
-          failure: { class: 'invalid_response', detail: version.detail },
-        };
-      }
-      return { healthy: true, failure: null };
+      return await classifyOpenCodeInfoResponse(response, signal);
     } catch (error) {
       return {
         healthy: false,
@@ -658,11 +692,12 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
       return false;
     }
 
+    let timeout = null;
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
+      timeout = setTimeout(() => controller.abort(), 3000);
       const base = origin ?? `http://127.0.0.1:${port}`;
-      const response = await fetch(`${base}${OPENCODE_HEALTH_PATH}`, {
+      const response = await fetch(`${base}${OPENCODE_INFO_PATH}`, {
         method: 'GET',
         headers: {
           Accept: 'application/json',
@@ -670,12 +705,13 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
         },
         signal: controller.signal,
       });
-      clearTimeout(timeout);
-      if (!response.ok) return false;
-      const body = await response.json().catch(() => null);
-      return body?.healthy === true;
+      return (await classifyOpenCodeInfoResponse(response, controller.signal)).healthy;
     } catch {
       return false;
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
     }
   };
 
@@ -770,9 +806,17 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
       const port = parseInt(url.port, 10);
       const prefix = normalizeApiPrefix(url.pathname);
 
-      const ready = await waitForReady(serverInstance.url, 10000);
+      const readiness = await waitForReady(serverInstance.url, 10000);
       if (state.isShuttingDown) throw new Error('OpenCode startup cancelled during shutdown');
-      if (ready) {
+      if (readiness === true || readiness?.ready) {
+        const versionResult = readiness?.version ? classifyOpenCodeVersion(readiness.version) : { ok: true };
+        if (!versionResult.ok) {
+          throw readinessError({
+            retryable: false,
+            class: 'incompatible_endpoint',
+            detail: versionResult.detail,
+          });
+        }
         setOpenCodePort(port);
         setDetectedOpenCodeApiPrefix(prefix);
 
@@ -790,7 +834,7 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
         return serverInstance;
       }
 
-      throw new Error('Server started but health check failed (timeout)');
+      throw readinessError({ ...readiness?.failure, retryable: readiness?.retryable });
     } catch (error) {
       await serverInstance?.close();
       if (serverInstance && state.openCodeProcess === serverInstance) state.openCodeProcess = null;
@@ -815,7 +859,11 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
         return await startOpenCodeOnce(attempt);
       } catch (error) {
         lastError = error;
-        if (state.isShuttingDown || error?.code === 'OPENCODE_BINARY_INVALID') {
+        if (
+          state.isShuttingDown
+          || error?.code === 'OPENCODE_BINARY_INVALID'
+          || error?.code?.startsWith('OPENCODE_READINESS_')
+        ) {
           break;
         }
         if (attempt >= START_OPEN_CODE_MAX_ATTEMPTS) {
@@ -960,40 +1008,37 @@ export const createOpenCodeLifecycleRuntime = (deps) => {
       let timeout = null;
       try {
         const controller = new AbortController();
-        timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
-        const response = await fetch(buildOpenCodeUrl(OPENCODE_HEALTH_PATH, ''), {
+        const remainingMs = deadline - Date.now();
+        timeout = setTimeout(() => controller.abort(), Math.min(HEALTH_CHECK_TIMEOUT_MS, remainingMs));
+        const response = await fetch(buildOpenCodeUrl(OPENCODE_INFO_PATH, ''), {
           method: 'GET',
           headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
           signal: controller.signal,
         });
-        clearTimeout(timeout);
-        timeout = null;
 
-        if (!response.ok) {
-          lastError = new Error(`OpenCode health endpoint responded with status ${response.status}`);
-          await new Promise((resolve) => setTimeout(resolve, intervalMs));
-          continue;
-        }
-
-        const body = await response.json().catch(() => null);
-        if (body?.healthy !== true) {
-          lastError = new Error('OpenCode health endpoint returned unhealthy response');
-          await new Promise((resolve) => setTimeout(resolve, intervalMs));
-          continue;
-        }
+        const readiness = await classifyOpenCodeInfoResponse(response, controller.signal);
+        if (!readiness.healthy) throw readinessError({ ...readiness.failure, retryable: false });
 
         state.isOpenCodeReady = true;
         state.lastOpenCodeError = null;
         return;
       } catch (error) {
         lastError = error;
+        if (error?.code?.startsWith('OPENCODE_READINESS_')) {
+          state.lastOpenCodeError = error.message || String(error);
+          throw error;
+        }
       } finally {
         if (timeout) {
           clearTimeout(timeout);
         }
       }
 
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remainingMs)));
     }
 
     if (lastError) {

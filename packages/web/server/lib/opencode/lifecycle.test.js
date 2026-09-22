@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const spawnMock = vi.fn();
 const spawnSyncMock = vi.fn();
@@ -23,10 +23,24 @@ const { createOpenCodeLifecycleRuntime } = await import('./lifecycle.js');
 const originalOpencodeBinary = process.env.OPENCODE_BINARY;
 const originalPath = process.env.PATH;
 const originalFetch = globalThis.fetch;
+const mockChildren = new Map();
+let nextMockChildPid = 12345;
+
+beforeEach(() => {
+  nextMockChildPid = 12345;
+  spawnSyncMock.mockImplementation((command, args) => {
+    if (command === 'taskkill') {
+      mockChildren.get(Number(args?.[1]))?.kill();
+    }
+    return { stdout: '' };
+  });
+});
 
 afterEach(() => {
+  vi.useRealTimers();
   spawnMock.mockReset();
   spawnSyncMock.mockReset();
+  mockChildren.clear();
   recordStartupPerformanceMock.mockReset();
   globalThis.fetch = originalFetch;
   if (typeof originalOpencodeBinary === 'string') {
@@ -48,12 +62,14 @@ const createMockChild = () => {
   child.stderr = new EventEmitter();
   child.exitCode = null;
   child.signalCode = null;
-  child.pid = 12345;
+  child.pid = nextMockChildPid;
+  nextMockChildPid += 1;
   child.kill = vi.fn(() => {
     child.signalCode = 'SIGTERM';
     queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
     return true;
   });
+  mockChildren.set(child.pid, child);
   return child;
 };
 
@@ -155,10 +171,50 @@ describe('OpenCode lifecycle', () => {
     }
   });
 
+  it.each([
+    {
+      name: 'an authentication failure',
+      failure: {
+        class: 'authentication',
+        detail: 'OpenCode readiness authentication failed (HTTP 401). Check the managed server password.',
+      },
+    },
+    {
+      name: 'an incompatible endpoint',
+      failure: {
+        class: 'incompatible_endpoint',
+        detail: 'OpenCode readiness endpoint /api/info is unavailable (HTTP 404). Update OpenCode.',
+      },
+    },
+    {
+      name: 'an invalid readiness response',
+      failure: {
+        class: 'invalid_response',
+        detail: 'OpenCode readiness endpoint returned invalid JSON.',
+      },
+    },
+  ])('does not retry managed startup after $name', async ({ failure }) => {
+    const child = createMockChild();
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        child.stdout.emit('data', 'opencode server listening on http://127.0.0.1:45678\n');
+      });
+      return child;
+    });
+    const runtime = createRuntime({
+      waitForReady: vi.fn(async () => ({ ready: false, retryable: false, failure })),
+    });
+
+    await expect(runtime.startOpenCode()).rejects.toThrow(failure.detail);
+    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(child.signalCode).toBe('SIGTERM');
+  });
+
   it('records an authoritative ready terminal event for external startup', async () => {
     globalThis.fetch = vi.fn(async () => ({
+      status: 200,
       ok: true,
-      json: async () => ({ healthy: true }),
+      json: async () => ({ version: '2.0.12', pid: 12345 }),
     }));
     const runtime = createRuntime({
       env: {
@@ -189,8 +245,9 @@ describe('OpenCode lifecycle', () => {
 
   it('recovers an external OPENCODE_HOST connection using its configured endpoint', async () => {
     const fetchMock = vi.fn(async () => ({
+      status: 200,
       ok: true,
-      json: async () => ({ healthy: true }),
+      json: async () => ({ version: '2.0.12', pid: 12345 }),
     }));
     globalThis.fetch = fetchMock;
     const runtime = createRuntime({}, {
@@ -206,7 +263,7 @@ describe('OpenCode lifecycle', () => {
     await runtime.restartOpenCode();
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://seamus:4095/api/health',
+      'http://seamus:4095/api/info',
       expect.objectContaining({ method: 'GET' }),
     );
     expect(runtime.testState.openCodePort).toBe(4095);
@@ -239,8 +296,9 @@ describe('OpenCode lifecycle', () => {
 
   it('warms recently used directories after a successful bootstrap', async () => {
     const fetchMock = vi.fn(async () => ({
+      status: 200,
       ok: true,
-      json: async () => ({ healthy: true }),
+      json: async () => ({ version: '2.0.12', pid: 12345 }),
     }));
     globalThis.fetch = fetchMock;
     const runtime = createRuntime({
@@ -347,14 +405,16 @@ describe('OpenCode lifecycle', () => {
     {
       name: 'invalid JSON',
       expectedClass: 'invalid_response',
+      expectedDetail: 'invalid JSON',
       fetchResult: () => ({
+        status: 200,
         ok: true,
         json: async () => {
           throw new SyntaxError('Unexpected token');
         },
       }),
     },
-  ])('classifies and stores a counted $name health failure', async ({ expectedClass, fetchResult }) => {
+  ])('classifies and stores a counted $name health failure', async ({ expectedClass, expectedDetail, fetchResult }) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     globalThis.fetch = vi.fn(fetchResult);
     const runtime = createRuntime({}, {
@@ -372,12 +432,43 @@ describe('OpenCode lifecycle', () => {
 
     expect(runtime.testState.lastOpenCodeHealthFailure).toEqual({
       class: expectedClass,
-      detail: expect.any(String),
+      detail: expectedDetail ? expect.stringContaining(expectedDetail) : expect.any(String),
       at: expect.any(String),
       source: 'immediate',
     });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(`class=${expectedClass}`));
     warn.mockRestore();
+  });
+
+  it('keeps the external readiness deadline active while the response body is stalled', async () => {
+    vi.useFakeTimers();
+    globalThis.fetch = vi.fn(async (_url, options) => ({
+      status: 200,
+      ok: true,
+      json: () => new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          const error = new Error('The operation was aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      }),
+    }));
+    const runtime = createRuntime({}, {
+      openCodePort: 4095,
+      openCodeBaseUrl: 'http://seamus:4095',
+      isExternalOpenCode: true,
+    }, {
+      ENV_CONFIGURED_OPENCODE_PORT: null,
+      ENV_CONFIGURED_OPENCODE_HOST: { origin: 'http://seamus:4095', port: 4095 },
+      ENV_EFFECTIVE_PORT: 4095,
+    });
+    const restartPromise = runtime.restartOpenCode();
+    const restartExpectation = expect(restartPromise).rejects
+      .toThrow('External OpenCode server on port 4095 is not responding');
+
+    await vi.advanceTimersByTimeAsync(3001);
+
+    await restartExpectation;
   });
 
   it('does not mistake a live managed process wrapper for an exited child', async () => {

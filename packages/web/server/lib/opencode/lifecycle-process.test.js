@@ -23,16 +23,23 @@ const createRuntime = (waitForReady, state) => createOpenCodeLifecycleRuntime({
 });
 
 describe('managed process lifecycle with real children', () => {
-  for (const failure of ['invalid-readiness', 'health-error', 'startup-timeout', 'shutdown-during-startup', 'none']) {
-    it(`reaps the server and its child after ${failure}`, async () => {
+  for (const scenario of ['invalid-readiness', 'health-error', 'startup-timeout', 'shutdown-during-startup', 'none', 'split-before-url', 'split-host-port']) {
+    it(`reaps the server and its child after ${scenario}`, async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-process-'));
       const previousRegistry = process.env.OPENCHAMBER_MANAGED_PROCESS_REGISTRY;
       process.env.OPENCHAMBER_MANAGED_PROCESS_REGISTRY = path.join(root, 'registry');
       const marker = path.join(root, 'pids');
       const childScript = `process.on('SIGTERM', () => {}); require('node:fs').appendFileSync(${JSON.stringify(marker)}, process.pid + '\\n'); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`;
-      let readinessMessage = 'opencode server listening on http://127.0.0.1:45678\n';
-      if (failure === 'invalid-readiness') readinessMessage = 'opencode server listening without a URL\n';
-      if (failure === 'startup-timeout' || failure === 'shutdown-during-startup') readinessMessage = '';
+      let readinessMessages = ['opencode server listening on http://127.0.0.1:45678\n'];
+      if (scenario === 'invalid-readiness') readinessMessages = ['opencode server listening without a URL\n'];
+      if (scenario === 'startup-timeout' || scenario === 'shutdown-during-startup') readinessMessages = [];
+      if (scenario === 'split-before-url') readinessMessages = ['opencode server listening on ', 'http://127.0.0.1:45678\n'];
+      if (scenario === 'split-host-port') readinessMessages = ['opencode server listening on http://127.0.', '0.1:45678\n'];
+      const readinessWrites = readinessMessages.map((message, index) => (
+        index === 0
+          ? `process.stdout.write(${JSON.stringify(message)});`
+          : `setTimeout(() => process.stdout.write(${JSON.stringify(message)}), 25);`
+      )).join('\n');
       // Node is an isolated stand-in for the native OpenCode binary. Lifecycle
       // still launches its real `serve --hostname ... --port ...` command.
       await fs.writeFile(path.join(root, 'serve'), `
@@ -40,33 +47,35 @@ describe('managed process lifecycle with real children', () => {
         fs.appendFileSync(${JSON.stringify(marker)}, process.pid + '\\n');
         const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: ['ignore', 'pipe', 'ignore'] });
         child.stdout.once('data', () => {
-          process.stdout.write(${JSON.stringify(readinessMessage)});
+          ${readinessWrites}
         });
         setInterval(() => {}, 1000);
       `);
       try {
         const state = { openCodeWorkingDirectory: root, useWslForOpencode: false };
         const runtime = createRuntime(async () => {
-          if (failure === 'health-error') throw new Error('fixture health failure');
+          if (scenario === 'health-error') throw new Error('fixture health failure');
           return true;
         }, state);
-        if (failure === 'none') {
+        const startsSuccessfully = scenario === 'none' || scenario.startsWith('split-');
+        if (startsSuccessfully) {
           const server = await runtime.startOpenCode();
+          expect(server.url).toBe('http://127.0.0.1:45678');
           await Promise.all([server.close(), server.close()]);
-        } else if (failure === 'shutdown-during-startup') {
+        } else if (scenario === 'shutdown-during-startup') {
           const starting = runtime.startOpenCode();
           const rejected = expect(starting).rejects.toThrow('exited before serving');
           await expect.poll(async () => (await fs.readFile(marker, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).length).toBe(2);
           state.isShuttingDown = true;
           await state.openCodeProcess.close();
           await rejected;
-        } else if (failure === 'startup-timeout') {
+        } else if (scenario === 'startup-timeout') {
           await expect(runtime.startOpenCode()).rejects.toThrow('Timeout waiting for OpenCode');
         } else {
-          await expect(runtime.startOpenCode()).rejects.toThrow(failure === 'health-error' ? 'fixture health failure' : 'Failed to parse server url');
+          await expect(runtime.startOpenCode()).rejects.toThrow(scenario === 'health-error' ? 'fixture health failure' : 'Failed to parse server url');
         }
         const pids = (await fs.readFile(marker, 'utf8')).trim().split('\n').map(Number);
-        expect(pids).toHaveLength(failure === 'none' || failure === 'shutdown-during-startup' ? 2 : 4);
+        expect(pids).toHaveLength(startsSuccessfully || scenario === 'shutdown-during-startup' ? 2 : 4);
         await expect.poll(() => pids.filter(alive), { timeout: 3000 }).toEqual([]);
         expect(await fs.readdir(path.join(root, 'registry')).catch(() => [])).toEqual([]);
       } finally {
