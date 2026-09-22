@@ -20,7 +20,8 @@ const integration = (overrides: Partial<IntegrationInfo> = {}): IntegrationInfo 
   ...overrides,
 });
 
-const credential: ConnectionInfo = { type: 'credential', id: 'cred_1', label: 'API key' };
+const credential: ConnectionInfo = { type: 'credential', id: 'cred_1', label: 'API key', method: 'key' };
+const oauthCredential: ConnectionInfo = { type: 'credential', id: 'cred_2', label: 'OAuth', method: 'oauth' };
 const envConnection: ConnectionInfo = { type: 'env', name: 'ANTHROPIC_API_KEY' };
 
 describe('ProvidersPage available provider loading', () => {
@@ -72,9 +73,9 @@ describe('integration method helpers', () => {
     expect(getKeyMethod(integration({ methods: [{ type: 'oauth', id: 'a', label: 'A' }] }))).toBe(undefined);
   });
 
-  test('getCredentialConnections keeps only removable stored credentials', () => {
-    expect(getCredentialConnections(integration({ connections: [credential, envConnection] })))
-      .toEqual([credential]);
+  test('getCredentialConnections keeps stored API-key and OAuth credentials', () => {
+    expect(getCredentialConnections(integration({ connections: [credential, oauthCredential, envConnection] })))
+      .toEqual([credential, oauthCredential]);
     expect(getCredentialConnections(integration({ connections: [envConnection] }))).toEqual([]);
   });
 });

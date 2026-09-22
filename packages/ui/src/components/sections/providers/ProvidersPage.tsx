@@ -24,7 +24,7 @@ import type { ModelMetadata } from '@/types';
 import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { opencodeClient } from '@/lib/opencode/client';
-import type { IntegrationInfo } from '@opencode/client';
+import type { ConnectionInfo, IntegrationInfo } from '@opencode/client';
 import { requiresProviderAuth, shouldLoadAvailableProviders } from './providerAvailability';
 import {
   providerHasCredentials,
@@ -69,6 +69,8 @@ const formatTokens = (value?: number | null) => {
 };
 
 const ADD_PROVIDER_ID = '__add_provider__';
+
+type CredentialMethod = Extract<ConnectionInfo, { type: 'credential' }>['method'];
 
 interface ProviderOption {
   id: string;
@@ -403,13 +405,13 @@ export const ProvidersPage: React.FC = () => {
     setIntegrationsRevision((revision) => revision + 1);
   }, []);
 
-  const markAuthWriteSucceeded = React.useCallback((providerId: string) => {
+  const markAuthWriteSucceeded = React.useCallback((providerId: string, method: CredentialMethod) => {
     // Optimistically record a connection so a providers refresh that has not yet
     // landed cannot reopen the panel / hide models with a stale
     // "Credentials missing" summary before the integration refetch arrives.
     setIntegrations((prev) => (prev ?? []).map((integration) => (
       integration.id === providerId && integration.connections.length === 0
-        ? { ...integration, connections: [{ type: 'credential', id: `pending:${providerId}`, label: providerId }] }
+        ? { ...integration, connections: [{ type: 'credential', id: `pending:${providerId}`, label: providerId, method }] }
         : integration
     )));
     setAuthPanelDismissedForId(null);
@@ -442,7 +444,7 @@ export const ProvidersPage: React.FC = () => {
       setApiKeyInputs((prev) => ({ ...prev, [providerId]: '' }));
       // OpenCode owns the credential and announces the catalog change itself
       // (`credential.updated` → catalog refresh); nothing to reload here.
-      markAuthWriteSucceeded(providerId);
+      markAuthWriteSucceeded(providerId, 'key');
     } catch (error) {
       console.error('Failed to save API key:', error);
       toast.error(t('settings.providers.page.toast.apiKeySaveFailed'));
@@ -497,7 +499,7 @@ export const ProvidersPage: React.FC = () => {
       setCustomAuthFailureHint(null);
       setLastCustomPersistId(null);
       // OpenCode watches its config file and rebuilds the catalog on its own.
-      markAuthWriteSucceeded(plan.providerID);
+      markAuthWriteSucceeded(plan.providerID, 'key');
     } catch (error) {
       console.error('Failed to save custom provider:', error);
       toast.error(
@@ -514,7 +516,7 @@ export const ProvidersPage: React.FC = () => {
     setShowAuthPanel(false);
     // Optimistic mark + sources refetch so the page does not stick on a stale
     // "Credentials missing" summary while the providers refresh lands.
-    markAuthWriteSucceeded(providerId);
+    markAuthWriteSucceeded(providerId, 'oauth');
   };
 
   const handleDisconnectProvider = async (providerId: string) => {
