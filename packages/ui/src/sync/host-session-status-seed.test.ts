@@ -13,6 +13,7 @@ import {
 } from './host-session-status-seed';
 import { resetSessionOrdering } from './session-ordering';
 import { resetSessionActivityTiming } from './session-activity-timing';
+import { applyGlobalBlockingRequestEvents, resetGlobalBlockingRequests, useGlobalBlockingRequestsStore } from './global-blocking-requests';
 
 const NOW = 1_700_000_000_000;
 
@@ -78,6 +79,7 @@ describe('seedGlobalSessionStatusFromHost', () => {
     replaceGlobalSessionStatusById(new Map());
     resetSessionOrdering();
     resetSessionActivityTiming();
+    resetGlobalBlockingRequests();
     requests = 0;
     originalGetSnapshot = opencodeClient.getHostSessionStatusSnapshot;
     opencodeClient.getHostSessionStatusSnapshot = async () => {
@@ -93,6 +95,7 @@ describe('seedGlobalSessionStatusFromHost', () => {
   afterEach(() => {
     opencodeClient.getHostSessionStatusSnapshot = originalGetSnapshot;
     replaceGlobalSessionStatusById(new Map());
+    resetGlobalBlockingRequests();
     useGlobalSessionsStore.getState().resetForRuntimeSwitch();
   });
 
@@ -127,6 +130,14 @@ describe('seedGlobalSessionStatusFromHost', () => {
     await seedGlobalSessionStatusFromHost();
     expect(useGlobalSessionStatusStore.getState().statusById.has('settled-here')).toBe(true);
 
+    applyGlobalBlockingRequestEvents('/repo', [{
+      type: 'permission.asked',
+      properties: { id: 'pending', sessionID: 'settled-here', action: 'shell', resources: [] },
+    }]);
+    snapshot = null;
+    await seedGlobalSessionStatusFromHost();
+    expect(useGlobalBlockingRequestsStore.getState().bySession.get('settled-here')?.permissions.map((request) => request.id)).toEqual(['pending']);
+
     snapshot = { serverTime: NOW, sessions: {}, pending: {} };
     await seedGlobalSessionStatusFromHost();
     expect(useGlobalSessionStatusStore.getState().statusById.has('settled-here')).toBe(true);
@@ -138,5 +149,28 @@ describe('seedGlobalSessionStatusFromHost', () => {
     expect(requests).toBe(1);
     await seedGlobalSessionStatusFromHost();
     expect(requests).toBe(2);
+  });
+
+  test('a delayed host snapshot preserves newer per-session blocking-request settlements while seeding unrelated sessions', async () => {
+    let resolveSnapshot!: (value: NonNullable<typeof snapshot>) => void;
+    opencodeClient.getHostSessionStatusSnapshot = () => new Promise((resolve) => { resolveSnapshot = resolve; });
+    const pending = seedGlobalSessionStatusFromHost();
+    await Promise.resolve();
+
+    applyGlobalBlockingRequestEvents('/repo', [
+      { type: 'permission.replied', properties: { sessionID: 'settled-here', requestID: 'permission' } },
+    ]);
+    resolveSnapshot({
+      serverTime: NOW,
+      sessions: {},
+      pending: {
+        'settled-here': { permissions: [{ id: 'permission', sessionID: 'settled-here', action: 'shell', resources: [] }], forms: [] },
+        'busy-elsewhere': { permissions: [{ id: 'unrelated', sessionID: 'busy-elsewhere', action: 'shell', resources: [] }], forms: [] },
+      },
+    });
+    await pending;
+
+    expect(useGlobalBlockingRequestsStore.getState().bySession.has('settled-here')).toBe(false);
+    expect(useGlobalBlockingRequestsStore.getState().bySession.get('busy-elsewhere')?.permissions.map((request) => request.id)).toEqual(['unrelated']);
   });
 });

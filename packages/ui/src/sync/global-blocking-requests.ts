@@ -28,11 +28,28 @@ type GlobalBlockingRequestsState = {
 
 const EMPTY: readonly never[] = [];
 
+// Host snapshots are asynchronous and therefore older than live lifecycle
+// events that arrive while the request is in flight. This is per session so a
+// reply for one session does not discard unrelated pending work in the same
+// host response. Runtime reset bounds ownership to the active runtime.
+let nextMutationRevision = 0;
+let mutationRevisionBySession = new Map<string, number>();
+
+const recordMutation = (sessionId: string): void => {
+  nextMutationRevision += 1;
+  mutationRevisionBySession.set(sessionId, nextMutationRevision);
+};
+
+export const captureGlobalBlockingRequestRevisions = (): ReadonlyMap<string, number> =>
+  new Map(mutationRevisionBySession);
+
 export const useGlobalBlockingRequestsStore = create<GlobalBlockingRequestsState>(() => ({
   bySession: new Map(),
 }));
 
 export const resetGlobalBlockingRequests = (): void => {
+  nextMutationRevision = 0;
+  mutationRevisionBySession = new Map();
   useGlobalBlockingRequestsStore.setState({ bySession: new Map() });
 };
 
@@ -126,17 +143,24 @@ export const applyGlobalBlockingRequestEvents = (rawDirectory: string, payloads:
         continue;
       }
       case 'permission.replied': {
-        if (payload.properties.sessionID) reducer.settle('permissions', payload.properties.sessionID, payload.properties.requestID);
+        if (payload.properties.sessionID) {
+          recordMutation(payload.properties.sessionID);
+          reducer.settle('permissions', payload.properties.sessionID, payload.properties.requestID);
+        }
         continue;
       }
       case 'form.settled': {
+        recordMutation(payload.properties.sessionID);
         reducer.settle('forms', payload.properties.sessionID, payload.properties.formID);
         continue;
       }
       case 'session.deleted': {
         // SAFETY: deletion event properties identify the deleted session directly or through info.id.
         const sessionId = payload.properties.sessionID;
-        if (sessionId) reducer.remove(sessionId);
+        if (sessionId) {
+          recordMutation(sessionId);
+          reducer.remove(sessionId);
+        }
         continue;
       }
       default:
@@ -159,10 +183,12 @@ export const seedGlobalBlockingRequests = (
     permissions: readonly Pick<PermissionRequest, 'id' | 'sessionID' | 'action' | 'resources'>[];
     forms: readonly Pick<FormRequest, 'id' | 'sessionID' | 'title'>[];
   }>,
+  capturedRevisions?: ReadonlyMap<string, number>,
 ): void => {
   const state = useGlobalBlockingRequestsStore.getState();
   const reducer = new Reducer(state);
   for (const entry of entries) {
+    if (capturedRevisions && mutationRevisionBySession.get(entry.sessionId) !== capturedRevisions.get(entry.sessionId)) continue;
     if (state.bySession.has(entry.sessionId)) continue;
     if (entry.permissions.length === 0 && entry.forms.length === 0) continue;
     reducer.write(entry.sessionId, {

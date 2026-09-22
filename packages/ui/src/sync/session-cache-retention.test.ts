@@ -271,6 +271,44 @@ describe("session cache retention", () => {
     expect(evictions).toBe(2)
   })
 
+  test("pruning externally removed history clears its idle deadline instead of rearming a stale timer", async () => {
+    const stores = new ChildStoreManager()
+    const store = stores.ensureChild("/repo", { bootstrap: false })
+    store.setState({ message: { removed: transcript("removed", 1).map(({ info }) => info) } })
+    const originalNow = Date.now
+    const originalSetTimeout = Object.getOwnPropertyDescriptor(globalThis, 'setTimeout')
+    const originalClearTimeout = Object.getOwnPropertyDescriptor(globalThis, 'clearTimeout')
+    let now = 10_000
+    let nextTimer = 0
+    const timers = new Set<number>()
+    Date.now = () => now
+    Object.defineProperty(globalThis, 'setTimeout', { configurable: true, value: () => {
+      const id = ++nextTimer
+      timers.add(id)
+      return id
+    } })
+    Object.defineProperty(globalThis, 'clearTimeout', { configurable: true, value: (id: number) => {
+      timers.delete(id)
+    } })
+    const retention = new SessionCacheRetention(stores, {
+      limit: 10, idleTtlMs: IDLE_TTL_MS, isCurrent: () => true, isViewed: () => false, isProtected: () => false, evict: () => {},
+    })
+    cleanups.push(() => {
+      retention.dispose()
+      stores.disposeAll()
+      Date.now = originalNow
+      if (originalSetTimeout) Object.defineProperty(globalThis, 'setTimeout', originalSetTimeout)
+      if (originalClearTimeout) Object.defineProperty(globalThis, 'clearTimeout', originalClearTimeout)
+    })
+
+    await flush()
+    expect(timers.size).toBe(1)
+    store.setState({ message: {} })
+    now += IDLE_TTL_MS
+    await flush()
+    expect(timers.size).toBe(0)
+  })
+
   test("many warm switches keep whole transcripts without repeating HTTP", async () => {
     const env = setup()
     for (let index = 0; index < 7; index += 1) {

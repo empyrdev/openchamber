@@ -116,7 +116,10 @@ export class SessionCacheRetention {
     const state = entry.store.getState()
     const protectedIds = getProtectedSessionCacheIds(state)
     for (const id of entry.seen) {
-      if (state.message[id] === undefined && !this.options.isProtected({ directory, sessionID: id })) entry.seen.delete(id)
+      if (state.message[id] === undefined && !this.options.isProtected({ directory, sessionID: id })) {
+        entry.seen.delete(id)
+        entry.idleSince.delete(id)
+      }
     }
     for (const id of Object.keys(state.message)) entry.seen.add(id)
     for (const sessionID of entry.seen) {

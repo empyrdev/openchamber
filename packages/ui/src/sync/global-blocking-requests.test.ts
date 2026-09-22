@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import type { SyncEvent } from '@/lib/opencode/events';
 import {
   applyGlobalBlockingRequestEvents,
+  captureGlobalBlockingRequestRevisions,
   resetGlobalBlockingRequests,
   seedGlobalBlockingRequests,
   useGlobalBlockingRequestsStore,
@@ -72,5 +73,34 @@ describe('global blocking requests index', () => {
     expect(bySession().get('s2')?.permissions.map((p) => p.id)).toEqual(['p2']);
     seedGlobalBlockingRequests([]);
     expect(bySession().has('s2')).toBe(true);
+  });
+
+  test('a seed captured before a reply, form settlement, or deletion cannot resurrect that session while unrelated sessions seed', () => {
+    const captured = captureGlobalBlockingRequestRevisions();
+    applyGlobalBlockingRequestEvents('/far', [
+      { type: 'permission.replied', properties: { sessionID: 'permission-settled', requestID: 'p1' } },
+      { type: 'form.settled', properties: { sessionID: 'form-settled', formID: 'f1' } },
+      { type: 'session.deleted', properties: { sessionID: 'deleted' } },
+    ]);
+
+    seedGlobalBlockingRequests([
+      { sessionId: 'permission-settled', directory: '/far', permissions: [permission('p1', 'permission-settled')], forms: [] },
+      { sessionId: 'form-settled', directory: '/far', permissions: [], forms: [form('f1', 'form-settled')] },
+      { sessionId: 'deleted', directory: '/far', permissions: [permission('p2', 'deleted')], forms: [] },
+      { sessionId: 'unrelated', directory: '/far', permissions: [permission('p3', 'unrelated')], forms: [] },
+    ], captured);
+
+    expect([...bySession().keys()]).toEqual(['unrelated']);
+  });
+
+  test('runtime reset clears reconciliation ownership for the next runtime', () => {
+    const captured = captureGlobalBlockingRequestRevisions();
+    applyGlobalBlockingRequestEvents('/far', [{ type: 'permission.replied', properties: { sessionID: 'previous-runtime', requestID: 'p1' } }]);
+    resetGlobalBlockingRequests();
+
+    seedGlobalBlockingRequests([
+      { sessionId: 'previous-runtime', directory: '/far', permissions: [permission('p1', 'previous-runtime')], forms: [] },
+    ], captured);
+    expect(bySession().get('previous-runtime')?.permissions.map((request) => request.id)).toEqual(['p1']);
   });
 });

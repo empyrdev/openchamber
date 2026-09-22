@@ -7,24 +7,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Icon } from '@/components/icon/Icon';
 import { ProviderLogo } from '@/components/ui/ProviderLogo';
 import { useI18n } from '@/lib/i18n';
-import { opencodeClient } from '@/lib/opencode/client';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { resolveGlobalSessionDirectory, useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useAllLiveSessions } from '@/sync/sync-context';
-import { getFusionSessionTitle } from '@/lib/multirun/title';
 import { getMultiRunIdentity, isFusionSource } from '@/lib/multirun/identity';
-import { loadFusionOutputs, type FusionSource } from '@/lib/multirun/fusion';
+import { type FusionSource } from '@/lib/multirun/fusion';
+import { startMultiRunFusion } from '@/lib/multirun/fusion-start';
 import { getRuntimeKey } from '@/lib/runtime-switch';
-import { renderMagicPrompt } from '@/lib/magicPrompts';
 import { AgentSelector } from './AgentSelector';
 import { ModelMultiSelect, generateInstanceId, type ModelSelectionWithId } from './ModelMultiSelect';
 import { listModelVariantIds, type ModelVariantSource } from '@/lib/modelVariants';
-
-const buildSourcePart = (source: FusionSource, text: string, index: number): string => {
-  const title = source.session.title?.trim() || source.session.id;
-  return `\n\n--- RESULT ${index + 1}: ${title} ---\n${text.trim()}\n--- END RESULT ${index + 1} ---`;
-};
 
 const getSessionProjectDirectory = (sessionId: string, directory: string | null): string | null => {
   const metadata = useSessionUIStore.getState().getWorktreeMetadata(sessionId);
@@ -111,44 +104,20 @@ export function MultiRunFusionDialog({
     };
     setIsStarting(true);
     try {
-      const usableSources = await loadFusionOutputs(sources, parsed, assertCurrent);
-
-      if (usableSources.length === 0) {
-        toast.error(t('multirun.fusion.toast.noOutputs'));
-        return;
-      }
-
-      const directory = sources[0]?.projectDirectory ?? sources[0]?.directory ?? null;
-      if (!directory) throw new Error('Fusion requires a session directory');
-      const fusionTitle = getFusionSessionTitle(parsed.groupSlug, providerID, modelID, parsed.runGroup);
-      const [visiblePrompt, instructionsPrompt] = await Promise.all([
-        renderMagicPrompt('session.fusion.visible'),
-        renderMagicPrompt('session.fusion.instructions'),
-      ]);
-      const fusionSession = await useSessionUIStore.getState().createSession(fusionTitle, directory, undefined, {
-        model: { providerID, id: modelID, variant: variant || undefined },
-        agent: agent || undefined,
-      });
-      if (!fusionSession) throw new Error('Failed to create fusion session');
-
-      useSessionUIStore.getState().setCurrentSession(fusionSession.id, directory);
-      onOpenChange(false);
-
-      assertCurrent();
-      await opencodeClient.sendMessage({
-        runtimeKey,
-        id: fusionSession.id,
+      const started = await startMultiRunFusion({
+        sources,
+        anchor: parsed,
         providerID,
-        model: { providerID, id: modelID, variant: variant || undefined },
-        agent: agent || undefined,
-        text: visiblePrompt,
-        context: [
-          { text: instructionsPrompt },
-          ...usableSources.map((item, index) => ({ text: buildSourcePart(item.source, item.text, index) })),
-          { text: '\n\n--- FUSION INPUTS END ---\nNow write the final fused answer.' },
-        ],
-        directory,
+        modelID,
+        variant,
+        agent,
+        runtimeKey,
+        onOpenChange,
+        assertCurrent,
       });
+      if (!started) {
+        toast.error(t('multirun.fusion.toast.noOutputs'));
+      }
     } catch (error) {
       if (getRuntimeKey() !== runtimeKey) return;
       console.error('[MultiRunFusion] Failed to start fusion', error);

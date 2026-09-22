@@ -4,7 +4,7 @@ import type { HostSessionStatusSnapshot } from '@/lib/opencode/session-status';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { resolveGlobalSessionDirectory, useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { applyGlobalSessionStatusEvents, useGlobalSessionStatusStore } from './global-session-status';
-import { seedGlobalBlockingRequests } from './global-blocking-requests';
+import { captureGlobalBlockingRequestRevisions, seedGlobalBlockingRequests } from './global-blocking-requests';
 
 // Seeds the cross-directory status index from the host's own map.
 //
@@ -68,6 +68,7 @@ let inFlight: Promise<void> | null = null;
 export const seedGlobalSessionStatusFromHost = (): Promise<void> => {
   if (inFlight) return inFlight;
   const runtimeKey = getRuntimeKey();
+  const blockingRevisions = captureGlobalBlockingRequestRevisions();
   inFlight = (async () => {
     const snapshot = await opencodeClient.getHostSessionStatusSnapshot();
     // A runtime switch between request and response clears the index; the old
@@ -95,7 +96,7 @@ export const seedGlobalSessionStatusFromHost = (): Promise<void> => {
       if (!directory) continue;
       pending.push({ sessionId, directory, permissions: entry.permissions, forms: entry.forms });
     }
-    seedGlobalBlockingRequests(pending);
+    seedGlobalBlockingRequests(pending, blockingRevisions);
   })().finally(() => {
     inFlight = null;
   });
